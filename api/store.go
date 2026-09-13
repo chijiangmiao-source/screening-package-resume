@@ -12,6 +12,11 @@ import (
 // ChunkSize is the fixed block size: exactly 1 MiB for every chunk except the last.
 const ChunkSize int64 = 1048576
 
+// MaxTotalBytes bounds a single delivery's declared size. Fixed 1 MiB
+// chunking plus the per-session missing-chunk list cannot represent
+// petabyte-scale metadata, so near-MaxInt64 totals are rejected at creation.
+const MaxTotalBytes int64 = 1 << 40 // 1 TiB (at most 1<<20 chunks)
+
 const (
 	StatusUploading = "uploading"
 	StatusCompleted = "completed"

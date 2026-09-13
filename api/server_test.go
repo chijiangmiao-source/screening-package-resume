@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 type testEnv struct {
 	t       *testing.T
 	srv     *httptest.Server
+	server  *Server
 	dataDir string
 }
 
@@ -38,7 +40,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		srv.Close()
 		db.Close()
 	})
-	return &testEnv{t: t, srv: srv, dataDir: dataDir}
+	return &testEnv{t: t, srv: srv, server: s, dataDir: dataDir}
 }
 
 func randomFile(t *testing.T, size int64) ([]byte, string) {
@@ -587,6 +589,162 @@ func TestSessionValidation(t *testing.T) {
 	}
 	if c := post(map[string]any{"filename": "a", "total_bytes": 0, "chunk_count": 0, "file_sha256": sha}); c != http.StatusBadRequest {
 		t.Fatalf("zero total: got %d", c)
+	}
+}
+
+// rawCreate POSTs an arbitrary request body and returns the status plus
+// how many sessions ended up persisted.
+func (e *testEnv) rawCreate(body string, headers map[string]string) (int, int) {
+	e.t.Helper()
+	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/sessions", strings.NewReader(body))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var n int
+	if err := e.server.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&n); err != nil {
+		e.t.Fatal(err)
+	}
+	return resp.StatusCode, n
+}
+
+// 摘要大小写：X-Chunk-SHA256 必须为小写十六进制；全大写但数值正确的
+// 摘要同样拒绝（400），且分块保持未确认。
+func TestChunkUppercaseDigestRejected(t *testing.T) {
+	env := newTestEnv(t)
+	total := ChunkSize + 7
+	file, fileSHA := randomFile(t, total)
+	sess := env.createSession("upper.mov", total, fileSHA)
+	data := chunkOf(t, file, total, 0)
+
+	req, _ := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("%s/api/sessions/%s/chunks/0", env.srv.URL, sess.SessionID),
+		bytes.NewReader(data))
+	// Uppercase encoding of the otherwise-correct digest.
+	req.Header.Set("X-Chunk-SHA256", strings.ToUpper(sha256Hex(data)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("uppercase digest header: got %d, want 400", resp.StatusCode)
+	}
+
+	// The chunk must remain unconfirmed: no row, zero bytes, still missing.
+	st := env.getSession(sess.SessionID)
+	if st.ReceivedCount != 0 || st.ConfirmedBytes != 0 {
+		t.Fatalf("rejected chunk was recorded: count=%d bytes=%d", st.ReceivedCount, st.ConfirmedBytes)
+	}
+	if !equalInts(st.MissingChunks, []int64{0, 1}) {
+		t.Fatalf("missing = %v, want [0 1]", st.MissingChunks)
+	}
+	if _, err := os.Stat(filepath.Join(env.dataDir, "chunks", sess.SessionID, "00000000.chunk")); !os.IsNotExist(err) {
+		t.Fatalf("rejected chunk left a file on disk: %v", err)
+	}
+	// The session stays uploadable.
+	if st.Status != StatusUploading {
+		t.Fatalf("status = %s, want uploading", st.Status)
+	}
+}
+
+// 尾随内容：合法对象后附加第二个 JSON 对象或尾随垃圾字节必须拒绝，
+// 且不得创建会话。仅有 JSON 允许的空白尾随则仍受理。
+func TestCreateSessionTrailingContentRejected(t *testing.T) {
+	env := newTestEnv(t)
+	sha := sha256Hex([]byte("x"))
+	first := func() string {
+		b, _ := json.Marshal(map[string]any{
+			"filename": "trailing.mov", "total_bytes": 10, "chunk_count": 1, "file_sha256": sha,
+		})
+		return string(b)
+	}
+	bad := map[string]string{
+		"second JSON object": first() + first(),
+		"trailing garbage":   first() + "???",
+	}
+	for name, body := range bad {
+		code, n := env.rawCreate(body, nil)
+		if code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", name, code)
+		}
+		if n != 0 {
+			t.Fatalf("%s: %d sessions persisted, want 0", name, n)
+		}
+	}
+	// RFC 8259 allows whitespace after the top-level value.
+	code, n := env.rawCreate(first()+"   \n\t ", nil)
+	if code != http.StatusCreated || n != 1 {
+		t.Fatalf("trailing whitespace: code=%d sessions=%d, want 201/1", code, n)
+	}
+}
+
+// 超大 total_bytes：天花板分块数 (total+ChunkSize-1)/ChunkSize 在 int64
+// 上溢出为负时，配合算出的负 chunk_count 必须拒绝；任何没有有效分块范围
+// （chunk_count < 1）的元数据都不得建会话。
+func TestCreateSessionHugeTotalBytesRejected(t *testing.T) {
+	env := newTestEnv(t)
+	sha := sha256Hex([]byte("x"))
+
+	// math.MaxInt64 pushes the ceiling computation into int64 overflow;
+	// derive the wrapped result in runtime int64 arithmetic, which is the
+	// client-supplied count the bug lets through.
+	var huge int64 = math.MaxInt64
+	wrappedCount := (huge + ChunkSize - 1) / ChunkSize // negative via wrap-around
+	if wrappedCount >= 0 {
+		t.Fatalf("test setup wrong: wrappedCount=%d", wrappedCount)
+	}
+	overflowBody := `{"filename":"overflow.mov","total_bytes":` +
+		fmt.Sprintf("%d", huge) + `,"chunk_count":` + fmt.Sprintf("%d", wrappedCount) +
+		`,"file_sha256":"` + sha + `"}`
+	code, n := env.rawCreate(overflowBody, nil)
+	if code != http.StatusBadRequest {
+		t.Fatalf("overflow total with negative chunk_count: got %d, want 400", code)
+	}
+	if n != 0 {
+		t.Fatalf("overflow request persisted %d sessions, want 0", n)
+	}
+
+	// Same huge total paired with the positive (arbitrary-precision) ceiling
+	// count must be rejected by the size bound, not crash the server.
+	posCount := (huge/ChunkSize + 1) // 2^43, no negative wrap
+	posBody := `{"filename":"huge.mov","total_bytes":` + fmt.Sprintf("%d", huge) +
+		`,"chunk_count":` + fmt.Sprintf("%d", posCount) + `,"file_sha256":"` + sha + `"}`
+	if code, n := env.rawCreate(posBody, nil); code != http.StatusBadRequest || n != 0 {
+		t.Fatalf("positive huge count: code=%d sessions=%d, want 400/0", code, n)
+	}
+	// Anything above the supported size cap is refused outright.
+	overCap := `{"filename":"cap.mov","total_bytes":` + fmt.Sprintf("%d", MaxTotalBytes+1) +
+		`,"chunk_count":1,"file_sha256":"` + sha + `"}`
+	if code, n := env.rawCreate(overCap, nil); code != http.StatusBadRequest || n != 0 {
+		t.Fatalf("total over cap: code=%d sessions=%d, want 400/0", code, n)
+	}
+
+	// Plain non-positive chunk counts are invalid regardless of total.
+	for _, cc := range []int64{0, -1, -42} {
+		body := `{"filename":"neg.mov","total_bytes":10,"chunk_count":` +
+			fmt.Sprintf("%d", cc) + `,"file_sha256":"` + sha + `"}`
+		if code, _ := env.rawCreate(body, nil); code != http.StatusBadRequest {
+			t.Fatalf("chunk_count=%d: got %d, want 400", cc, code)
+		}
+	}
+
+	// The count must still equal the exact ceiling, even for large values.
+	big := int64(1) << 40
+	wrongCeil := (big + ChunkSize - 1) / ChunkSize
+	body := `{"filename":"big.mov","total_bytes":` + fmt.Sprintf("%d", big) +
+		`,"chunk_count":` + fmt.Sprintf("%d", wrongCeil+1) + `,"file_sha256":"` + sha + `"}`
+	if code, n := env.rawCreate(body, nil); code != http.StatusBadRequest || n != 0 {
+		t.Fatalf("large file mismatched count: code=%d sessions=%d, want 400/0", code, n)
 	}
 }
 

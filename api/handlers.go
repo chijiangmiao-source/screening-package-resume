@@ -70,6 +70,19 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// rejectTrailingJSON fails any non-whitespace token left after the first
+// decoded JSON value, so bodies like {"...":...}{"...":...} are rejected.
+// Trailing whitespace alone is legal per RFC 8259.
+func rejectTrailingJSON(dec *json.Decoder) error {
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err == io.EOF {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("invalid trailing content after JSON body")
+	}
+	return fmt.Errorf("request body must contain exactly one JSON object")
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -140,8 +153,15 @@ type createSessionReq struct {
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req createSessionReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	if err := dec.Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// The body must contain exactly one JSON value: a second object or any
+	// other trailing token is rejected (trailing whitespace is allowed).
+	if err := rejectTrailingJSON(dec); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	req.Filename = strings.TrimSpace(req.Filename)
@@ -153,7 +173,22 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "total_bytes must be >= 1")
 		return
 	}
-	wantChunks := (req.TotalBytes + ChunkSize - 1) / ChunkSize
+	if req.TotalBytes > MaxTotalBytes {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("total_bytes %d exceeds supported maximum %d", req.TotalBytes, MaxTotalBytes))
+		return
+	}
+	if req.ChunkCount < 1 {
+		writeErr(w, http.StatusBadRequest, "chunk_count must be >= 1")
+		return
+	}
+	// Overflow-safe ceil(total_bytes / ChunkSize): adding ChunkSize-1 to a
+	// near-MaxInt64 total would wrap negative and accept a bogus negative
+	// chunk_count, which describes no valid chunk range.
+	wantChunks := req.TotalBytes / ChunkSize
+	if req.TotalBytes%ChunkSize != 0 {
+		wantChunks++
+	}
 	if req.ChunkCount != wantChunks {
 		writeErr(w, http.StatusBadRequest,
 			fmt.Sprintf("chunk_count %d does not match total_bytes (expect %d)", req.ChunkCount, wantChunks))
@@ -248,7 +283,10 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 
 	sum := sha256.Sum256(body)
 	actualSHA := hex.EncodeToString(sum[:])
-	declared := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Chunk-SHA256")))
+	// Protocol requires lowercase hex: compare the header verbatim instead
+	// of normalising case, so an all-uppercase (but otherwise correct)
+	// digest is rejected and the chunk stays unconfirmed.
+	declared := strings.TrimSpace(r.Header.Get("X-Chunk-SHA256"))
 	if !sha256HexRE.MatchString(declared) {
 		writeErr(w, http.StatusBadRequest, "X-Chunk-SHA256 header must be 64 lowercase hex characters")
 		return

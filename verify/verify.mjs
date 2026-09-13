@@ -248,6 +248,72 @@ async function main() {
   resp = await fetch(`${API}/api/sessions/${'0'.repeat(32)}/download`)
   check('unknown session download returns 404', resp.status === 404, `got ${resp.status}`)
 
+  // ---------- scenario 6: strict digest casing and session metadata ----------
+  console.log('[6] strict digest casing, single-object body, chunk-count range')
+  const file6 = crypto.randomBytes(CHUNK + 11)
+  r = await createSession('strict-check.mov', file6, sha(file6))
+  const s6 = r.body.session_id
+
+  // Uppercase encoding of the otherwise-correct chunk digest is rejected.
+  r = await api(`/sessions/${s6}/chunks/0`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-SHA256': sha(slice(file6, 0)).toUpperCase() },
+    body: slice(file6, 0),
+  })
+  check('uppercase (but correct) chunk digest rejected', r.status === 400, `got ${r.status}`)
+  r = await api(`/sessions/${s6}`)
+  check('uppercase-rejected chunk stays unconfirmed',
+    r.body.received_count === 0 && r.body.confirmed_bytes === 0,
+    `count=${r.body.received_count} bytes=${r.body.confirmed_bytes}`)
+
+  // A valid JSON object followed by a second object / garbage is rejected.
+  const validMeta = JSON.stringify({
+    filename: 'trailing.mov',
+    total_bytes: file6.length,
+    chunk_count: Math.ceil(file6.length / CHUNK),
+    file_sha256: sha(file6),
+  })
+  r = await api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: validMeta + validMeta,
+  })
+  check('trailing second JSON object rejected', r.status === 400, `got ${r.status}`)
+  r = await api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: validMeta + '???',
+  })
+  check('trailing garbage after JSON body rejected', r.status === 400, `got ${r.status}`)
+
+  // Overflow: near-MaxInt64 total_bytes with the wrapped (negative) ceiling
+  // count must be refused. BigInt.asIntN wraps the (total+ChunkSize-1)
+  // addition the way int64 arithmetic does.
+  const huge = 2n ** 63n - 1n
+  const wrappedCount = BigInt.asIntN(64, BigInt.asIntN(64, huge + BigInt(CHUNK) - 1n) / BigInt(CHUNK))
+  if (wrappedCount >= 0n) throw new Error(`test setup: expected negative wrap, got ${wrappedCount}`)
+  r = await api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: `{"filename":"overflow.mov","total_bytes":${huge},"chunk_count":${wrappedCount},"file_sha256":"${sha(file6)}"}`,
+  })
+  check('overflow total_bytes with wrapped negative chunk_count rejected', r.status === 400, `got ${r.status}`)
+  // Same huge total with the positive (mathematically correct) count exceeds
+  // the supported size cap and must also be refused.
+  const posCount = (huge + BigInt(CHUNK) - 1n) / BigInt(CHUNK)
+  r = await api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: `{"filename":"toobig.mov","total_bytes":${huge},"chunk_count":${posCount},"file_sha256":"${sha(file6)}"}`,
+  })
+  check('petabyte-scale total_bytes rejected by size cap', r.status === 400, `got ${r.status}`)
+  r = await api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: 'zero.mov', total_bytes: 10, chunk_count: 0, file_sha256: sha(file6) }),
+  })
+  check('zero chunk_count rejected', r.status === 400, `got ${r.status}`)
+
   console.log(`\nverify: ${passed} passed, ${failed} failed`)
   if (failed > 0) process.exit(1)
   console.log('verify: ACCEPTANCE OK')

@@ -105,8 +105,12 @@ export async function uploadChunks(sessionId, file, indexes, { concurrency = 4, 
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         result = await uploadChunk(sessionId, idx, blob)
         if (!result.network) break
-        if (onRetry) onRetry(idx, attempt + 1)
-        await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 10_000)))
+        // The attempt that exhausts the budget is the final try, not an
+        // additional retry: announce/back off only when another try remains.
+        if (attempt < maxRetries) {
+          if (onRetry) onRetry(idx, attempt + 1)
+          await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 10_000)))
+        }
       }
       if (result.network) {
         failure = { network: true, index: idx, body: result.body }
