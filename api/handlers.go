@@ -1,0 +1,486 @@
+package main
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+var sha256HexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+type Server struct {
+	db      *sql.DB
+	dataDir string
+	mu      sync.Mutex // serializes chunk ingestion and assembly per process
+}
+
+func NewServer(db *sql.DB, dataDir string) (*Server, error) {
+	for _, d := range []string{filepath.Join(dataDir, "chunks"), filepath.Join(dataDir, "artifacts")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	return &Server{db: db, dataDir: dataDir}, nil
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
+	mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
+	mux.HandleFunc("POST /api/sessions/{id}/chunks/{index}", s.handleUploadChunk)
+	mux.HandleFunc("POST /api/sessions/{id}/assemble", s.handleAssemble)
+	return cors(mux)
+}
+
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- session JSON ----
+
+type sessionJSON struct {
+	SessionID      string  `json:"session_id"`
+	Filename       string  `json:"filename"`
+	TotalBytes     int64   `json:"total_bytes"`
+	ChunkCount     int64   `json:"chunk_count"`
+	ChunkSize      int64   `json:"chunk_size"`
+	FileSHA256     string  `json:"file_sha256"`
+	Status         string  `json:"status"`
+	ReceivedCount  int64   `json:"received_count"`
+	ConfirmedBytes int64   `json:"confirmed_bytes"`
+	MissingChunks  []int64 `json:"missing_chunks"`
+	FinalSHA256    *string `json:"final_sha256"`
+	Error          *string `json:"error"`
+}
+
+func (s *Server) sessionResponse(sess *Session) (*sessionJSON, error) {
+	chunks, err := s.listChunks(sess.ID)
+	if err != nil {
+		return nil, err
+	}
+	present := make(map[int64]bool, len(chunks))
+	var confirmed int64
+	for _, c := range chunks {
+		present[c.Index] = true
+		confirmed += c.Size
+	}
+	missing := make([]int64, 0)
+	for i := int64(0); i < sess.ChunkCount; i++ {
+		if !present[i] {
+			missing = append(missing, i)
+		}
+	}
+	resp := &sessionJSON{
+		SessionID:      sess.ID,
+		Filename:       sess.Filename,
+		TotalBytes:     sess.TotalBytes,
+		ChunkCount:     sess.ChunkCount,
+		ChunkSize:      ChunkSize,
+		FileSHA256:     sess.FileSHA256,
+		Status:         sess.Status,
+		ReceivedCount:  int64(len(chunks)),
+		ConfirmedBytes: confirmed,
+		MissingChunks:  missing,
+	}
+	if sess.FinalSHA256.Valid {
+		resp.FinalSHA256 = &sess.FinalSHA256.String
+	}
+	if sess.Error.Valid {
+		resp.Error = &sess.Error.String
+	}
+	return resp, nil
+}
+
+// ---- handlers ----
+
+type createSessionReq struct {
+	Filename   string `json:"filename"`
+	TotalBytes int64  `json:"total_bytes"`
+	ChunkCount int64  `json:"chunk_count"`
+	FileSHA256 string `json:"file_sha256"`
+}
+
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var req createSessionReq
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	req.Filename = strings.TrimSpace(req.Filename)
+	if req.Filename == "" || len(req.Filename) > 255 {
+		writeErr(w, http.StatusBadRequest, "filename must be 1..255 characters")
+		return
+	}
+	if req.TotalBytes < 1 {
+		writeErr(w, http.StatusBadRequest, "total_bytes must be >= 1")
+		return
+	}
+	wantChunks := (req.TotalBytes + ChunkSize - 1) / ChunkSize
+	if req.ChunkCount != wantChunks {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("chunk_count %d does not match total_bytes (expect %d)", req.ChunkCount, wantChunks))
+		return
+	}
+	if !sha256HexRE.MatchString(req.FileSHA256) {
+		writeErr(w, http.StatusBadRequest, "file_sha256 must be 64 lowercase hex characters")
+		return
+	}
+
+	id, err := newSessionID()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot allocate session id")
+		return
+	}
+	sess := &Session{
+		ID:         id,
+		Filename:   req.Filename,
+		TotalBytes: req.TotalBytes,
+		ChunkCount: req.ChunkCount,
+		FileSHA256: req.FileSHA256,
+		Status:     StatusUploading,
+	}
+	if err := s.createSession(sess); err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot persist session")
+		return
+	}
+	if err := os.MkdirAll(s.chunkDir(id), 0o755); err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot create chunk directory")
+		return
+	}
+	resp, err := s.sessionResponse(sess)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.getSession(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sess == nil {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	resp, err := s.sessionResponse(sess)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.getSession(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sess == nil {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if sess.Status != StatusUploading {
+		writeErr(w, http.StatusConflict, "session is "+sess.Status)
+		return
+	}
+	index, err := strconv.ParseInt(r.PathValue("index"), 10, 64)
+	if err != nil || index < 0 || index >= sess.ChunkCount {
+		writeErr(w, http.StatusBadRequest, "chunk index out of range")
+		return
+	}
+
+	wantLen := ExpectedChunkLen(sess.TotalBytes, sess.ChunkCount, index)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, wantLen+1))
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, "chunk body too large")
+		return
+	}
+	if int64(len(body)) != wantLen {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("chunk %d must be exactly %d bytes, got %d", index, wantLen, len(body)))
+		return
+	}
+
+	sum := sha256.Sum256(body)
+	actualSHA := hex.EncodeToString(sum[:])
+	declared := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Chunk-SHA256")))
+	if !sha256HexRE.MatchString(declared) {
+		writeErr(w, http.StatusBadRequest, "X-Chunk-SHA256 header must be 64 lowercase hex characters")
+		return
+	}
+	if declared != actualSHA {
+		writeErr(w, http.StatusBadRequest, "chunk content does not match X-Chunk-SHA256 header")
+		return
+	}
+
+	existing, err := s.findChunk(sess.ID, index)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if existing != nil {
+		if existing.SHA256 == actualSHA {
+			// Idempotent retry: same index, same digest -> success, not counted twice.
+			s.respondChunk(w, http.StatusOK, sess, index, actualSHA, wantLen, true)
+			return
+		}
+		// Same index, different content: freeze the session as failed.
+		reason := fmt.Sprintf("chunk %d conflict: stored sha256 %s, received %s",
+			index, existing.SHA256, actualSHA)
+		if err := s.failSession(sess.ID, reason); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeErr(w, http.StatusConflict, reason)
+		return
+	}
+
+	if err := s.persistChunk(sess.ID, index, body); err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot persist chunk: "+err.Error())
+		return
+	}
+	if err := s.insertChunk(sess.ID, index, actualSHA, wantLen); err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot record chunk: "+err.Error())
+		return
+	}
+	s.respondChunk(w, http.StatusCreated, sess, index, actualSHA, wantLen, false)
+}
+
+func (s *Server) respondChunk(w http.ResponseWriter, status int, sess *Session, index int64, sha string, size int64, duplicate bool) {
+	count, confirmed, err := s.chunkStats(sess.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, status, map[string]any{
+		"session_id":      sess.ID,
+		"index":           index,
+		"sha256":          sha,
+		"size":            size,
+		"duplicate":       duplicate,
+		"received_count":  count,
+		"confirmed_bytes": confirmed,
+		"status":          sess.Status,
+	})
+}
+
+// persistChunk writes the chunk to the data volume atomically (temp file + rename).
+func (s *Server) persistChunk(sessionID string, index int64, body []byte) error {
+	dir := s.chunkDir(sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, s.chunkPath(sessionID, index))
+}
+
+func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.getSession(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sess == nil {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if sess.Status != StatusUploading {
+		writeErr(w, http.StatusConflict, "session is "+sess.Status)
+		return
+	}
+
+	chunks, err := s.listChunks(sess.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if int64(len(chunks)) != sess.ChunkCount {
+		resp, _ := s.sessionResponse(sess)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":          "cannot assemble: chunks missing",
+			"missing_chunks": resp.MissingChunks,
+		})
+		return
+	}
+
+	if err := os.MkdirAll(s.artifactDir(), 0o755); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tmp, err := os.CreateTemp(s.artifactDir(), ".assemble-*")
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tmpName := tmp.Name()
+
+	whole := sha256.New()
+	out := io.MultiWriter(tmp, whole)
+	for _, c := range chunks {
+		if err := appendChunk(out, s.chunkPath(sess.ID, c.Index), c.SHA256); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			reason := fmt.Sprintf("stored chunk %d failed integrity check: %v", c.Index, err)
+			s.failWithSession(w, sess, reason)
+			return
+		}
+	}
+	finalSHA := hex.EncodeToString(whole.Sum(nil))
+
+	if finalSHA != sess.FileSHA256 {
+		tmp.Close()
+		os.Remove(tmpName)
+		reason := fmt.Sprintf("assembled sha256 %s does not match declared %s", finalSHA, sess.FileSHA256)
+		s.failWithSession(w, sess, reason)
+		return
+	}
+
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Atomic publish: rename within the same filesystem.
+	finalPath := s.artifactPath(sess)
+	if err := os.Rename(tmpName, finalPath); err != nil {
+		os.Remove(tmpName)
+		writeErr(w, http.StatusInternalServerError, "publish failed: "+err.Error())
+		return
+	}
+	if err := s.completeSession(sess.ID, finalSHA); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	sess.Status = StatusCompleted
+	sess.FinalSHA256 = sql.NullString{String: finalSHA, Valid: true}
+	resp, err := s.sessionResponse(sess)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// failWithSession freezes the session and answers with the full session state
+// so clients can directly observe the failure.
+func (s *Server) failWithSession(w http.ResponseWriter, sess *Session, reason string) {
+	_ = s.failSession(sess.ID, reason)
+	sess.Status = StatusFailed
+	sess.Error = sql.NullString{String: reason, Valid: true}
+	resp, err := s.sessionResponse(sess)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusConflict, resp)
+}
+
+// appendChunk streams one stored chunk into w while re-verifying its digest.
+func appendChunk(w io.Writer, path, wantSHA string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), f); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != wantSHA {
+		return fmt.Errorf("sha256 %s != recorded %s", got, wantSHA)
+	}
+	return nil
+}
+
+func newSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('_')
+		}
+	}
+	if sb.Len() == 0 {
+		return "file"
+	}
+	return sb.String()
+}
