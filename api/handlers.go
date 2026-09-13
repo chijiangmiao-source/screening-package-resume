@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,6 +42,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	mux.HandleFunc("POST /api/sessions/{id}/chunks/{index}", s.handleUploadChunk)
 	mux.HandleFunc("POST /api/sessions/{id}/assemble", s.handleAssemble)
+	mux.HandleFunc("GET /api/sessions/{id}/download", s.handleDownload)
 	return cors(mux)
 }
 
@@ -48,7 +50,8 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256, Range")
+		w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Disposition")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -457,6 +460,126 @@ func appendChunk(w io.Writer, path, wantSHA string) error {
 		return fmt.Errorf("sha256 %s != recorded %s", got, wantSHA)
 	}
 	return nil
+}
+
+// ---- artifact download ----
+
+// handleDownload serves the published artifact of a completed session.
+// A plain GET returns the whole file (200); a single, satisfiable Range
+// returns 206 so interrupted transfers can resume from a byte offset.
+// Multi-range or unsatisfiable requests are rejected with 416 and no body.
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.getSession(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sess == nil {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if sess.Status != StatusCompleted {
+		writeErr(w, http.StatusConflict, "session is "+sess.Status+": artifact not published")
+		return
+	}
+
+	f, err := os.Open(s.artifactPath(sess))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Database says completed but the artifact is gone from the volume.
+			writeErr(w, http.StatusGone, "artifact missing on storage volume")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	size := st.Size()
+
+	h := w.Header()
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Content-Disposition", contentDisposition(sess.Filename))
+
+	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+	if rangeHeader == "" {
+		h.Set("Content-Length", strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = io.Copy(w, f)
+		}
+		return
+	}
+
+	start, length, ok := parseSingleRange(rangeHeader, size)
+	if !ok {
+		// Unsatisfiable / multi-range / malformed: 416 with no body.
+		h.Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
+	h.Set("Content-Length", strconv.FormatInt(length, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.CopyN(w, io.NewSectionReader(f, start, length), length)
+}
+
+// parseSingleRange parses exactly one HTTP byte-range spec against the
+// artifact size. It returns ok=false for malformed specs, multi-range
+// requests (not supported), and ranges that cannot be satisfied.
+func parseSingleRange(header string, size int64) (start, length int64, ok bool) {
+	spec, found := strings.CutPrefix(header, "bytes=")
+	if !found || spec == "" || strings.Contains(spec, ",") {
+		return 0, 0, false
+	}
+	first, last, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, false
+	}
+	switch {
+	case first == "":
+		// Suffix range: the last N bytes.
+		n, err := strconv.ParseInt(last, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false
+		}
+		if n > size {
+			n = size
+		}
+		return size - n, n, true
+	case last == "":
+		// Open range: from start to the end of the file.
+		s, err := strconv.ParseInt(first, 10, 64)
+		if err != nil || s < 0 || s >= size {
+			return 0, 0, false
+		}
+		return s, size - s, true
+	default:
+		s, err1 := strconv.ParseInt(first, 10, 64)
+		e, err2 := strconv.ParseInt(last, 10, 64)
+		if err1 != nil || err2 != nil || s < 0 || e < s || s >= size {
+			return 0, 0, false
+		}
+		if e >= size {
+			e = size - 1
+		}
+		return s, e - s + 1, true
+	}
+}
+
+// contentDisposition keeps the original filename for the browser download:
+// an ASCII fallback for legacy clients plus the RFC 5987 UTF-8 form.
+func contentDisposition(filename string) string {
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
+		sanitizeFilename(filename), url.PathEscape(filename))
 }
 
 func newSessionID() (string, error) {

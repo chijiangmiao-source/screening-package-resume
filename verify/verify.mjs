@@ -182,6 +182,72 @@ async function main() {
   })
   check('digest header not matching content rejected', r.status === 400, `got ${r.status}`)
 
+  // ---------- scenario 5: artifact download with range resume ----------
+  console.log('[5] artifact download: full, ranged resume, invalid ranges')
+  // The session from scenario 1 is completed; its artifact is on the volume.
+  const dl = `/sessions/${sess.session_id}/download`
+
+  // Old session query still works after publishing.
+  r = await api(`/sessions/${sess.session_id}`)
+  check('completed session still queryable', r.status === 200 && r.body.status === 'completed')
+
+  // Full download: 200, byte-identical, original filename advertised.
+  let resp = await fetch(`${API}/api${dl}`)
+  const full = Buffer.from(await resp.arrayBuffer())
+  check('full download returns 200', resp.status === 200, `got ${resp.status}`)
+  check('full download bytes identical to source', full.equals(file),
+    `got ${full.length} bytes, want ${file.length}`)
+  check('full download Content-Length is total bytes',
+    resp.headers.get('content-length') === String(file.length),
+    `got ${resp.headers.get('content-length')}`)
+  check('full download advertises Accept-Ranges: bytes',
+    resp.headers.get('accept-ranges') === 'bytes')
+  check('Content-Disposition keeps original filename',
+    (resp.headers.get('content-disposition') || '').includes('festival-screening.mov'),
+    `got ${resp.headers.get('content-disposition')}`)
+
+  // Interrupted transfer resumes by offset: first part, then the remainder.
+  const split = CHUNK // pretend the connection dropped after 1 MiB
+  resp = await fetch(`${API}/api${dl}`, { headers: { Range: `bytes=0-${split - 1}` } })
+  const part1 = Buffer.from(await resp.arrayBuffer())
+  check('first range returns 206', resp.status === 206, `got ${resp.status}`)
+  check('first range Content-Range exact',
+    resp.headers.get('content-range') === `bytes 0-${split - 1}/${file.length}`,
+    `got ${resp.headers.get('content-range')}`)
+  check('first range Content-Length exact',
+    resp.headers.get('content-length') === String(split),
+    `got ${resp.headers.get('content-length')}`)
+  check('first range bytes match source prefix', part1.equals(file.subarray(0, split)))
+
+  resp = await fetch(`${API}/api${dl}`, { headers: { Range: `bytes=${split}-` } })
+  const part2 = Buffer.from(await resp.arrayBuffer())
+  check('resume range returns 206', resp.status === 206, `got ${resp.status}`)
+  check('resume range Content-Range exact',
+    resp.headers.get('content-range') === `bytes ${split}-${file.length - 1}/${file.length}`,
+    `got ${resp.headers.get('content-range')}`)
+  check('rejoined parts identical to source', Buffer.concat([part1, part2]).equals(file))
+
+  // Out-of-bounds and multi-range requests: 416 with no body.
+  resp = await fetch(`${API}/api${dl}`, { headers: { Range: `bytes=${file.length}-` } })
+  let body = await resp.text()
+  check('out-of-bounds range returns 416', resp.status === 416, `got ${resp.status}`)
+  check('416 carries Content-Range */size',
+    resp.headers.get('content-range') === `bytes */${file.length}`,
+    `got ${resp.headers.get('content-range')}`)
+  check('416 has no body', body.length === 0, `got ${body.length} bytes`)
+  resp = await fetch(`${API}/api${dl}`, { headers: { Range: 'bytes=0-1,3-4' } })
+  body = await resp.text()
+  check('multi-range request returns 416', resp.status === 416, `got ${resp.status}`)
+  check('multi-range 416 has no body', body.length === 0, `got ${body.length} bytes`)
+
+  // Sessions that never published cannot be downloaded.
+  resp = await fetch(`${API}/api/sessions/${s4}/download`) // still uploading
+  check('uploading session download returns 409', resp.status === 409, `got ${resp.status}`)
+  resp = await fetch(`${API}/api/sessions/${s2}/download`) // frozen as failed
+  check('failed session download returns 409', resp.status === 409, `got ${resp.status}`)
+  resp = await fetch(`${API}/api/sessions/${'0'.repeat(32)}/download`)
+  check('unknown session download returns 404', resp.status === 404, `got ${resp.status}`)
+
   console.log(`\nverify: ${passed} passed, ${failed} failed`)
   if (failed > 0) process.exit(1)
   console.log('verify: ACCEPTANCE OK')

@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import {
   CHUNK_SIZE, chunkCountFor, hashFile,
   createSession, getSession, uploadChunks, assemble,
+  downloadUrl, checkDownload,
 } from './client.js'
 
 const LS_KEY = 'delivery.session'
@@ -16,10 +17,12 @@ const log = ref([])
 const manualId = ref('')
 const saved = ref(null)        // pending session restored from localStorage
 const retrying = ref(false)    // a chunk is being retried after a network drop
+const downloadError = ref('')  // 409/410 reason shown inside the download area
 let autoResumeTimer = null
 
 const confirmedBytes = computed(() => session.value?.confirmed_bytes ?? 0)
 const missingChunks = computed(() => session.value?.missing_chunks ?? [])
+const isCompleted = computed(() => session.value?.status === 'completed')
 const progressPct = computed(() => {
   if (!session.value || !session.value.total_bytes) return 0
   return Math.min(100, (confirmedBytes.value / session.value.total_bytes) * 100)
@@ -57,6 +60,7 @@ async function refreshSession(id) {
   const { status, body } = await getSession(id)
   if (status === 200) {
     session.value = body
+    downloadError.value = ''
     if (body.status === 'failed') { phase.value = 'failed'; error.value = body.error || '会话已冻结为 failed' }
     if (body.status === 'completed') phase.value = 'done'
     return true
@@ -230,6 +234,33 @@ async function doAssemble() {
   }
 }
 
+// Pre-flight the artifact endpoint, then hand the real download to the
+// browser so Content-Disposition keeps the original filename. Failures
+// (409 not published / 410 artifact gone) stay inside the download area.
+async function downloadArtifact() {
+  if (!session.value) return
+  downloadError.value = ''
+  const id = session.value.session_id
+  const pre = await checkDownload(id)
+  if (pre.network) {
+    downloadError.value = '网络中断，无法连接服务器，请稍后重试'
+    note('成品下载预检失败：网络中断')
+    return
+  }
+  if (pre.status !== 200) {
+    downloadError.value = pre.body?.error || `成品不可下载（HTTP ${pre.status}）`
+    note(`成品下载被拒绝（HTTP ${pre.status}）：${downloadError.value}`)
+    return
+  }
+  const a = document.createElement('a')
+  a.href = downloadUrl(id)
+  a.download = session.value.filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  note(`已开始下载成品「${session.value.filename}」（${fmtBytes(session.value.total_bytes)}）`)
+}
+
 function reset() {
   if (autoResumeTimer) {
     clearInterval(autoResumeTimer)
@@ -241,6 +272,7 @@ function reset() {
   file.value = null
   phase.value = 'idle'
   error.value = ''
+  downloadError.value = ''
   retrying.value = false
   log.value = []
 }
@@ -309,6 +341,19 @@ function reset() {
       <div class="bar"><i :class="session.status" :style="{ width: progressPct + '%' }"></i></div>
     </section>
 
+    <section v-if="isCompleted" class="card download" data-test="download-area">
+      <h2>成品下载</h2>
+      <table class="kv">
+        <tr><td>文件名</td><td><code>{{ session.filename }}</code></td></tr>
+        <tr><td>总字节数</td><td>{{ session.total_bytes }}（{{ fmtBytes(session.total_bytes) }}）</td></tr>
+      </table>
+      <div class="row">
+        <button data-test="download-btn" @click="downloadArtifact">下载成品</button>
+      </div>
+      <p class="hint">浏览器下载将沿用原始文件名；网络中断后可从已接收位置继续，无需重新传输整个文件。</p>
+      <p v-if="downloadError" class="err" data-test="download-error">{{ downloadError }}</p>
+    </section>
+
     <p v-if="error" class="err banner">{{ error }}</p>
 
     <section v-if="log.length" class="card">
@@ -347,6 +392,8 @@ code.ok { color: #4ade80; }
 .banner { background: #2b1518; border: 1px solid #7f1d1d; padding: 10px 14px; border-radius: 8px; }
 .card.alert { border-color: #b45309; background: #241a10; }
 .card.alert h2 { color: #fbbf24; }
+.card.download { border-color: #15803d; }
+.card.download h2 { color: #4ade80; }
 .warn { color: #fbbf24; }
 .bar { height: 8px; background: #10131a; border-radius: 999px; margin-top: 12px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: #3b82f6; transition: width 0.2s; }

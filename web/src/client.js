@@ -63,6 +63,31 @@ export function assemble(sessionId) {
   return api(`/sessions/${sessionId}/assemble`, { method: 'POST' })
 }
 
+// URL the browser navigates to for the artifact download; the server's
+// Content-Disposition header keeps the original filename.
+export function downloadUrl(sessionId) {
+  return `/api/sessions/${sessionId}/download`
+}
+
+// Pre-flight the download endpoint with a 1-byte range request so the page
+// can surface 409 (not published) / 410 (artifact gone) — including the
+// server's reason — in the download area instead of navigating to an
+// error page. A successful pre-flight returns 206 and transfers one byte.
+export async function checkDownload(sessionId) {
+  try {
+    const resp = await fetch(downloadUrl(sessionId), {
+      headers: { Range: 'bytes=0-0' },
+      signal: AbortSignal.timeout(60_000),
+    })
+    if (resp.status === 200 || resp.status === 206) return { status: 200 }
+    let body = null
+    try { body = await resp.json() } catch { /* no JSON body */ }
+    return { status: resp.status, body }
+  } catch (err) {
+    return { status: 0, network: true, body: { error: `网络连接中断：${err.message}` } }
+  }
+}
+
 // Upload every index in `indexes` with a small worker pool.
 // Chunk uploads are idempotent, so network errors are retried with backoff;
 // only when retries are exhausted (or the server rejects a chunk) does the

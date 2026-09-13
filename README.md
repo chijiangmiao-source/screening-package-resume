@@ -32,6 +32,13 @@ docker compose up --exit-code-from verify verify   # 需要退出码时
 4. **组装发布** `POST /api/sessions/{id}/assemble`
    仅当全部分块存在时受理：按序写入临时文件并逐块复核摘要，整文件 SHA-256 与申报一致才
    `rename` 原子发布到 `artifacts/` 并标记 `completed`；摘要不符则标记 `failed`，临时文件删除，**成品不可见**。
+5. **成品下载** `GET /api/sessions/{id}/download`
+   仅 `completed` 会话可下载，响应带 `Content-Disposition`（沿用原始文件名）与 `Accept-Ranges: bytes`：
+   - 不带 `Range`：整文件 `200` 返回；
+   - **单段** `Range`（如 `bytes=1048576-`）：`206` 并返回准确的 `Content-Range` / `Content-Length`，
+     网络中断后可从已接收字节偏移继续，无需重传整个文件；
+   - 越界、倒置、**多段**或格式错误的范围：`416` + `Content-Range: bytes */<size>`，**无正文**；
+   - 上传中 / 已失败会话：`409`；数据库已完成但成品文件缺失：`410`；未知会话：`404`。
 
 ## 目录结构
 
@@ -39,11 +46,13 @@ docker compose up --exit-code-from verify verify   # 需要退出码时
 api/      Go API（标准库 + modernc.org/sqlite，纯 Go 无需 CGO）
   main.go       入口；内置 -healthcheck 供容器健康检查
   store.go      SQLite 模式、会话/分块元数据、数据卷路径
-  handlers.go   HTTP 接口：会话、分块、组装、幂等与冲突冻结、原子发布
-  server_test.go  真实测试：中断续传、重复幂等、冲突冻结、组装成功/失败、重启恢复
+  handlers.go   HTTP 接口：会话、分块、组装、幂等与冲突冻结、原子发布、成品下载（单段 Range 续传）
+  server_test.go  真实测试：中断续传、重复幂等、冲突冻结、组装成功/失败、重启恢复、
+                完整/续传下载字节一致、非法范围 416 无正文、未发布 409、成品缺失 410
 web/      Vue 3 + Vite 前端，nginx 反代 /api 到 api 服务
   src/sha256.js 纯 JS 增量 SHA-256（分片读文件，已对照 node:crypto 校验）
-  src/client.js 分块、并发上传、断点续传客户端逻辑
+  src/client.js 分块、并发上传、断点续传客户端逻辑、成品下载预检
+  src/App.download.test.js 前端交互测试（vitest + jsdom，打内存版同协议 API）
 verify/   一次性验收服务：真实 HTTP 联调 + 共享卷核查成品可见性
 docker-compose.yml  web / api / verify 三服务，WEB_PORT、API_PORT 可覆盖
 ```
@@ -55,18 +64,29 @@ docker-compose.yml  web / api / verify 三服务，WEB_PORT、API_PORT 可覆盖
   cd api && go test ./...
   ```
   覆盖：中断后按缺块续传、同序号同摘要幂等不重复计数、同序号不同内容冻结 failed、
-  组装成功原子发布、整文件摘要不符失败且成品不可见、分块长度与摘要头校验、进程重启后会话状态恢复。
+  组装成功原子发布、整文件摘要不符失败且成品不可见、分块长度与摘要头校验、进程重启后会话状态恢复；
+  成品下载：完整下载字节一致、按偏移续传拼接一致、越界/多段范围 416 无正文、
+  上传中/失败会话 409、成品缺失 410、未知会话 404。
   API 镜像构建阶段会强制执行 `go vet` 与上述测试。
-- **verify 验收服务**（容器内真实联调，31 项断言）：
+- **verify 验收服务**（容器内真实联调，52 项断言）：
   中断→缺块列表→重复块幂等→补传→组装发布→卷上成品字节级核对；
-  冲突冻结；摘要篡改失败且成品不可见；长度/摘要头协议校验。
-- **前端**：`cd web && npm ci && npm run build`（镜像构建阶段同样执行）。
+  冲突冻结；摘要篡改失败且成品不可见；长度/摘要头协议校验；
+  成品完整下载字节一致、按偏移续传拼接一致、非法范围 416 无正文、未发布会话 409。
+- **前端交互测试**（vitest + jsdom，挂载真实 App 组件）：
+  ```bash
+  cd web && npm ci && npm test
+  ```
+  覆盖：completed 后下载区域显示文件名/总字节数/下载按钮、预检成功后交给浏览器下载、
+  409/410 原因显示在下载区域、旧会话查询出现下载入口、上传流程不受影响。
+  Web 镜像构建阶段同样执行 `npm test` 与 `npm run build`。
 
 ## 页面可观测性
 
 页面实时显示：已确认字节数 / 总字节数、已确认分块数、**缺块列表**、进度条、
 `uploading / completed / failed` 状态徽章、**完成摘要**（绿色）与失败原因（红色），
 并保留事件日志——续传成功与冲突失败都能被直接观察。
+会话进入 `completed` 后出现**成品下载**区域：文件名、总字节数与下载按钮，
+浏览器下载沿用原始文件名；下载不可用（409 未发布 / 410 成品缺失）时原因直接显示在该区域。
 
 ## 网络中断与续传
 
