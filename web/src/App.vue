@@ -8,13 +8,15 @@ import {
 const LS_KEY = 'delivery.session'
 
 const file = ref(null)
-const phase = ref('idle') // idle | hashing | uploading | assembling | done | failed
+const phase = ref('idle') // idle | hashing | uploading | interrupted | assembling | done | failed
 const hashProgress = ref(0)
 const session = ref(null)      // server session JSON
 const error = ref('')
 const log = ref([])
 const manualId = ref('')
 const saved = ref(null)        // pending session restored from localStorage
+const retrying = ref(false)    // a chunk is being retried after a network drop
+let autoResumeTimer = null
 
 const confirmedBytes = computed(() => session.value?.confirmed_bytes ?? 0)
 const missingChunks = computed(() => session.value?.missing_chunks ?? [])
@@ -86,9 +88,15 @@ async function start() {
   }
 
   const chunkCount = chunkCountFor(f.size)
-  const { status, body } = await createSession({
+  const { status, body, network } = await createSession({
     filename: f.name, totalBytes: f.size, chunkCount, fileSha256: digest,
   })
+  if (network) {
+    phase.value = 'idle'
+    error.value = '无法连接服务器，请检查网络后重试（文件摘要已计算，无需重新选择）'
+    note('创建会话失败：网络中断')
+    return
+  }
   if (status !== 201) {
     phase.value = 'failed'
     error.value = body?.error || `创建会话失败（HTTP ${status}）`
@@ -129,7 +137,12 @@ async function uploadMissing() {
   try {
     await uploadChunks(sess.session_id, file.value, missing, {
       concurrency: 4,
+      onRetry: (idx, attempt) => {
+        retrying.value = true
+        note(`分块 ${idx} 网络中断，第 ${attempt} 次重试…`)
+      },
       onChunk: (idx, info) => {
+        retrying.value = false
         session.value = {
           ...session.value,
           confirmed_bytes: info.confirmed_bytes,
@@ -140,6 +153,14 @@ async function uploadMissing() {
       },
     })
   } catch (fail) {
+    retrying.value = false
+    if (fail && fail.network) {
+      // Network is down: keep the session, offer (and schedule) resumption.
+      phase.value = 'interrupted'
+      note(`分块 ${fail.index} 多次重试仍失败：网络未恢复，会话已保存，可续传`)
+      scheduleAutoResume(sess.session_id)
+      return
+    }
     note(`分块 ${fail.index} 上传被拒绝（HTTP ${fail.status}）`)
     await refreshSession(sess.session_id)
     if (phase.value !== 'failed') {
@@ -152,10 +173,49 @@ async function uploadMissing() {
   return doAssemble()
 }
 
+// Poll the session until the API is reachable again, then resume exactly
+// where we stopped: re-query the missing list and upload only those chunks.
+function scheduleAutoResume(id) {
+  if (autoResumeTimer) return
+  autoResumeTimer = setInterval(() => resumeNow(id), 3000)
+}
+
+async function resumeNow(id = session.value?.session_id) {
+  if (!id) return
+  const r = await getSession(id)
+  if (r.network) return // still offline; the timer will try again
+  if (autoResumeTimer) {
+    clearInterval(autoResumeTimer)
+    autoResumeTimer = null
+  }
+  session.value = r.body
+  note('连接已恢复，已重新查询缺块列表')
+  if (r.body.status === 'completed') {
+    phase.value = 'done'
+    localStorage.removeItem(LS_KEY)
+    saved.value = null
+  } else if (r.body.status === 'failed') {
+    phase.value = 'failed'
+    error.value = r.body.error || '会话已冻结为 failed'
+  } else if (r.body.missing_chunks.length === 0) {
+    return doAssemble()
+  } else {
+    return uploadMissing()
+  }
+}
+
 async function doAssemble() {
   phase.value = 'assembling'
   note('全部分块就绪，请求按序组装…')
-  const { status, body } = await assemble(session.value.session_id)
+  const { status, body, network } = await assemble(session.value.session_id)
+  if (network) {
+    // The assemble request may or may not have reached the server; re-query
+    // the session on recovery instead of guessing.
+    phase.value = 'interrupted'
+    note('组装请求时网络中断，恢复后将重新查询会话状态')
+    scheduleAutoResume(session.value.session_id)
+    return
+  }
   if (status === 200) {
     session.value = body
     phase.value = 'done'
@@ -171,12 +231,17 @@ async function doAssemble() {
 }
 
 function reset() {
+  if (autoResumeTimer) {
+    clearInterval(autoResumeTimer)
+    autoResumeTimer = null
+  }
   localStorage.removeItem(LS_KEY)
   saved.value = null
   session.value = null
   file.value = null
   phase.value = 'idle'
   error.value = ''
+  retrying.value = false
   log.value = []
 }
 </script>
@@ -201,6 +266,18 @@ function reset() {
       </div>
       <div v-if="phase === 'hashing'" class="bar"><i :style="{ width: (hashProgress * 100) + '%' }"></i></div>
       <div v-if="phase === 'hashing'" class="hint">计算整文件 SHA-256… {{ (hashProgress * 100).toFixed(0) }}%</div>
+      <div v-if="retrying" class="hint warn">网络波动，正在自动重试当前分块…</div>
+    </section>
+
+    <section v-if="phase === 'interrupted'" class="card alert">
+      <h2>连接中断，可续传</h2>
+      <p class="hint">
+        网络暂时断开，会话 <code>{{ session?.session_id }}</code> 已保存，已确认的字节不会丢失。
+        正在每 3 秒自动重新查询缺块并续传；网络恢复后无需重新选择文件之外的任何操作。
+      </p>
+      <div class="row">
+        <button @click="resumeNow()">立即续传</button>
+      </div>
     </section>
 
     <section class="card">
@@ -268,6 +345,9 @@ code.ok { color: #4ade80; }
 .missing { color: #fbbf24; font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
 .err { color: #f87171; }
 .banner { background: #2b1518; border: 1px solid #7f1d1d; padding: 10px 14px; border-radius: 8px; }
+.card.alert { border-color: #b45309; background: #241a10; }
+.card.alert h2 { color: #fbbf24; }
+.warn { color: #fbbf24; }
 .bar { height: 8px; background: #10131a; border-radius: 999px; margin-top: 12px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: #3b82f6; transition: width 0.2s; }
 .bar i.completed { background: #22c55e; }

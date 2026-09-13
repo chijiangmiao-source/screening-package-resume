@@ -23,11 +23,17 @@ export async function hashFile(file, onProgress) {
 }
 
 async function api(path, options = {}) {
-  const resp = await fetch(`/api${path}`, options)
-  const text = await resp.text()
-  let body = null
-  try { body = text ? JSON.parse(text) : null } catch { body = { error: text } }
-  return { status: resp.status, body }
+  try {
+    // Timeout guards against half-open connections hanging the page forever.
+    const resp = await fetch(`/api${path}`, { signal: AbortSignal.timeout(60_000), ...options })
+    const text = await resp.text()
+    let body = null
+    try { body = text ? JSON.parse(text) : null } catch { body = { error: text } }
+    return { status: resp.status, body }
+  } catch (err) {
+    // Network drop / timeout: surfaced as status 0 so callers can resume later.
+    return { status: 0, network: true, body: { error: `网络连接中断：${err.message}` } }
+  }
 }
 
 export function createSession({ filename, totalBytes, chunkCount, fileSha256 }) {
@@ -58,9 +64,10 @@ export function assemble(sessionId) {
 }
 
 // Upload every index in `indexes` with a small worker pool.
-// onChunk(sessionJson-ish) is invoked after each chunk; if the server reports
-// a conflict the returned error aborts the pool.
-export async function uploadChunks(sessionId, file, indexes, { concurrency = 4, onChunk } = {}) {
+// Chunk uploads are idempotent, so network errors are retried with backoff;
+// only when retries are exhausted (or the server rejects a chunk) does the
+// pool abort by throwing a failure descriptor.
+export async function uploadChunks(sessionId, file, indexes, { concurrency = 4, onChunk, onRetry, maxRetries = 5 } = {}) {
   let pos = 0
   let failure = null
   async function worker() {
@@ -68,7 +75,19 @@ export async function uploadChunks(sessionId, file, indexes, { concurrency = 4, 
       const idx = indexes[pos++]
       const start = idx * CHUNK_SIZE
       const end = Math.min(start + CHUNK_SIZE, file.size)
-      const { status, body } = await uploadChunk(sessionId, idx, file.slice(start, end))
+      const blob = file.slice(start, end)
+      let result = null
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        result = await uploadChunk(sessionId, idx, blob)
+        if (!result.network) break
+        if (onRetry) onRetry(idx, attempt + 1)
+        await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 10_000)))
+      }
+      if (result.network) {
+        failure = { network: true, index: idx, body: result.body }
+        return
+      }
+      const { status, body } = result
       if (status === 200 || status === 201) {
         if (onChunk) onChunk(idx, body)
       } else {
