@@ -2,23 +2,29 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   CHUNK_SIZE, chunkCountFor, hashFile,
-  createSession, getSession, uploadChunks, assemble,
+  createSession, generateCreateToken, getSession, uploadChunks, assemble,
   downloadUrl, checkDownload,
 } from './client.js'
 import { subscribeProgress, eventsSupported } from './events.js'
 
 const LS_KEY = 'delivery.session'
+const HTTP_CONFLICT = 409 // same create token presented with different metadata
 
 const file = ref(null)
-const phase = ref('idle') // idle | hashing | uploading | interrupted | assembling | done | failed
+const phase = ref('idle') // idle | hashing | uploading | interrupted | assembling | create-failed | done | failed
 const hashProgress = ref(0)
 const session = ref(null)      // server session JSON
 const error = ref('')
 const log = ref([])
 const manualId = ref('')
-const saved = ref(null)        // pending session restored from localStorage
+const saved = ref(null)        // pending session/create restored from localStorage
 const retrying = ref(false)    // a chunk is being retried after a network drop
 const downloadError = ref('')  // 409/410 reason shown inside the download area
+// pendingCreate holds the parameters of a create request whose response was
+// lost to a network failure: the "重试创建" button re-sends the SAME create
+// token together with the already computed whole-file digest.
+const pendingCreate = ref(null)
+const creatingSession = ref(false)
 // Live-progress link state. The stream only refreshes the progress area;
 // it never drives upload controls ('interrupted' here is just the notice).
 const streamState = ref('')    // '' | connecting | live | interrupted
@@ -54,7 +60,15 @@ onMounted(() => {
   if (raw) {
     try {
       saved.value = JSON.parse(raw)
-      note(`发现未完成会话 ${saved.value.sessionId}，重新选择同一文件即可续传`)
+      if (saved.value.sessionId) {
+        note(`发现未完成会话 ${saved.value.sessionId}，重新选择同一文件即可续传`)
+      } else if (saved.value.createToken) {
+        // The create was sent (and may already have been accepted server
+        // side) but its response never came back: re-pick the same file and
+        // press 校验并续传 to replay the saved token instead of opening a
+        // second, unidentifiable session.
+        note('上次创建会话的响应可能已丢失，请重新选择同一文件后点“校验并续传”取回')
+      }
     } catch { localStorage.removeItem(LS_KEY) }
   }
 })
@@ -123,6 +137,88 @@ function bindSession(s) {
   startProgressStream(s.session_id)
 }
 
+// proceedAfterCreate handles a successful create answer. status 201 is the
+// first answer; 200 is the idempotent replay of a create whose response was
+// lost (same token resolved to the original session's current snapshot).
+async function proceedAfterCreate(body, p, status) {
+  bindSession(body)
+  if (body.status === 'completed') {
+    // 成品复用命中：服务端已有同内容成品，零分块完成，跳过上传与组装。
+    phase.value = 'done'
+    localStorage.removeItem(LS_KEY)
+    saved.value = null
+    if (status === 200) {
+      note(`重试取回已完成会话 ${body.session_id}（复用来源 ${body.artifact_source}），标识与复用结果一致`)
+    } else {
+      note(`已复用成品（来源会话 ${body.artifact_source}），无需上传 ${p.chunkCount} 个分块`)
+    }
+    return
+  }
+  localStorage.setItem(LS_KEY, JSON.stringify({
+    sessionId: body.session_id,
+    createToken: p.token,
+    fileName: p.name,
+    fileSize: p.size,
+    fileSha256: p.digest,
+  }))
+  if (status === 200) {
+    note(`重试取回原会话 ${body.session_id}（已确认 ${body.confirmed_bytes} 字节），继续仅补传缺块`)
+  } else {
+    note(`会话已创建：${body.session_id}（${p.chunkCount} 块 × 1 MiB）`)
+  }
+  return uploadMissing()
+}
+
+// requestCreate persists the create token locally BEFORE sending, then posts
+// the create request. A lost response is retried verbatim via retryCreate:
+// the server resolves the same token to the original session instead of
+// inserting a second one.
+async function requestCreate(p) {
+  creatingSession.value = true
+  // Save the token (without a session id yet) before the first byte goes on
+  // the wire, so a timeout right after the server accepted the request is
+  // recoverable even if the page is reloaded.
+  const record = { createToken: p.token, fileName: p.name, fileSize: p.size, fileSha256: p.digest }
+  localStorage.setItem(LS_KEY, JSON.stringify(record))
+  saved.value = record
+
+  const { status, body, network } = await createSession({
+    filename: p.name,
+    totalBytes: p.size,
+    chunkCount: p.chunkCount,
+    fileSha256: p.digest,
+    reuseArtifact: p.reuseArtifact,
+    createToken: p.token,
+  })
+  creatingSession.value = false
+
+  if (network) {
+    // The request may already have been accepted server side; keep the token
+    // and offer an idempotent retry rather than opening a second session.
+    phase.value = 'create-failed'
+    pendingCreate.value = p
+    error.value = '创建请求可能已送达但响应丢失：会话不会重复，点“重试创建”用同一令牌取回（文件摘要已保存，无需重新计算）'
+    note('创建会话响应丢失：已在本地保存创建令牌，可重试')
+    return
+  }
+  if (status === HTTP_CONFLICT) {
+    // Same token, different metadata: the original session is untouched.
+    // The only valid recovery is to start over with a freshly minted token.
+    phase.value = 'failed'
+    pendingCreate.value = p
+    error.value = `${body?.error || '创建令牌与原会话元数据冲突'}；请点“重新开始”生成新令牌，勿再重试本次创建`
+    note('创建令牌冲突：原会话未改动，需要重新开始')
+    return
+  }
+  if (status !== 201 && status !== 200) {
+    phase.value = 'failed'
+    error.value = body?.error || `创建会话失败（HTTP ${status}）`
+    return
+  }
+  pendingCreate.value = null
+  return proceedAfterCreate(body, p, status)
+}
+
 async function start() {
   if (!file.value) return
   error.value = ''
@@ -133,8 +229,9 @@ async function start() {
   const digest = await hashFile(f, (p) => { hashProgress.value = p })
   note(`整文件 SHA-256 = ${digest}`)
 
-  // Resume path: a saved session for the same file content.
-  if (saved.value && saved.value.fileSize === f.size && saved.value.fileSha256 === digest) {
+  // Resume path 1: a session was already created for the same file content;
+  // only the missing chunks need to be uploaded.
+  if (saved.value?.sessionId && saved.value.fileSize === f.size && saved.value.fileSha256 === digest) {
     note(`续传会话 ${saved.value.sessionId}，仅补传缺块`)
     if (await refreshSession(saved.value.sessionId)) {
       if (session.value.status === 'uploading') return uploadMissing()
@@ -146,34 +243,51 @@ async function start() {
   }
 
   const chunkCount = chunkCountFor(f.size)
-  const { status, body, network } = await createSession({
-    filename: f.name, totalBytes: f.size, chunkCount, fileSha256: digest, reuseArtifact: true,
+
+  // Resume path 2 (after a reload): the create response was lost before a
+  // session id was ever known. The saved token replays the create when the
+  // re-picked file really is the same content; a different file starts fresh.
+  let token
+  if (saved.value?.createToken && !saved.value?.sessionId &&
+      saved.value.fileSize === f.size && saved.value.fileSha256 === digest) {
+    token = saved.value.createToken
+    note(`复用本地保存的创建令牌 ${token.slice(0, 8)}… 重试创建`)
+  } else {
+    token = generateCreateToken()
+  }
+
+  return requestCreate({
+    name: f.name, size: f.size, chunkCount, digest,
+    reuseArtifact: true, token,
   })
-  if (network) {
-    phase.value = 'idle'
-    error.value = '无法连接服务器，请检查网络后重试（文件摘要已计算，无需重新选择）'
-    note('创建会话失败：网络中断')
+}
+
+// retryCreate re-sends the very same create with the saved token and the
+// already computed digest — no re-hash, no new token.
+async function retryCreate() {
+  const p = pendingCreate.value
+  if (!p) {
+    error.value = '没有待重试的创建请求，请重新选择文件'
     return
   }
-  if (status !== 201) {
-    phase.value = 'failed'
-    error.value = body?.error || `创建会话失败（HTTP ${status}）`
+  error.value = ''
+  note('使用同一创建令牌重试…')
+  return requestCreate(p)
+}
+
+// restartCreate mints a brand-new token after a 409 token conflict and
+// re-submits the same delivery (digest is already known, so no re-hash).
+async function restartCreate() {
+  const p = pendingCreate.value
+  if (!p) {
+    reset()
     return
   }
-  bindSession(body)
-  if (body.status === 'completed') {
-    // 成品复用命中：服务端已有同内容成品，零分块完成，跳过上传与组装。
-    phase.value = 'done'
-    localStorage.removeItem(LS_KEY)
-    saved.value = null
-    note(`已复用成品（来源会话 ${body.artifact_source}），无需上传 ${chunkCount} 个分块`)
-    return
-  }
-  localStorage.setItem(LS_KEY, JSON.stringify({
-    sessionId: body.session_id, fileName: f.name, fileSize: f.size, fileSha256: digest,
-  }))
-  note(`会话已创建：${body.session_id}（${chunkCount} 块 × 1 MiB）`)
-  return uploadMissing()
+  error.value = ''
+  localStorage.removeItem(LS_KEY)
+  saved.value = null
+  note('生成新的创建令牌，重新开始')
+  return requestCreate({ ...p, token: generateCreateToken() })
 }
 
 async function resumeById() {
@@ -331,6 +445,8 @@ function reset() {
   stopProgressStream()
   localStorage.removeItem(LS_KEY)
   saved.value = null
+  pendingCreate.value = null
+  creatingSession.value = false
   session.value = null
   file.value = null
   phase.value = 'idle'
@@ -353,20 +469,39 @@ onBeforeUnmount(() => {
 
     <section class="card">
       <label class="pick">
-        <input type="file" @change="onPick" :disabled="phase === 'uploading' || phase === 'hashing'" />
+        <input type="file" @change="onPick" :disabled="phase === 'uploading' || phase === 'hashing' || phase === 'create-failed' || (phase === 'failed' && pendingCreate)" />
       </label>
       <div v-if="file" class="fileinfo">
         {{ file.name }} — {{ fmtBytes(file.size) }}（{{ chunkCountFor(file.size) }} 块）
       </div>
       <div class="row">
-        <button @click="start" :disabled="!file || phase === 'uploading' || phase === 'hashing' || phase === 'assembling'">
+        <button v-if="phase === 'create-failed'" data-test="retry-create-btn" @click="retryCreate">
+          重试创建
+        </button>
+        <button v-else-if="phase === 'failed' && pendingCreate" data-test="restart-create-btn" @click="restartCreate">
+          重新开始（生成新令牌）
+        </button>
+        <button v-else @click="start" :disabled="!file || phase === 'uploading' || phase === 'hashing' || phase === 'assembling'">
           {{ saved ? '校验并续传' : '开始交付' }}
         </button>
         <button class="ghost" @click="reset">清空</button>
       </div>
       <div v-if="phase === 'hashing'" class="bar"><i :style="{ width: (hashProgress * 100) + '%' }"></i></div>
       <div v-if="phase === 'hashing'" class="hint">计算整文件 SHA-256… {{ (hashProgress * 100).toFixed(0) }}%</div>
+      <div v-if="creatingSession" class="hint">正在创建会话…</div>
       <div v-if="retrying" class="hint warn">网络波动，正在自动重试当前分块…</div>
+    </section>
+
+    <section v-if="phase === 'create-failed'" class="card alert" data-test="create-retry-card">
+      <h2>创建响应丢失，可安全重试</h2>
+      <p class="hint">
+        创建请求可能已被服务端受理但响应超时丢失。重试将复用本地保存的<b>创建令牌</b>
+        <code>{{ pendingCreate?.token }}</code> 与已算出的文件摘要：
+        若服务端已建会话则取回原会话（不会产生重复会话或丢失已命中的成品复用），否则照常新建。
+      </p>
+      <div class="row">
+        <button data-test="retry-create-btn-2" @click="retryCreate">重试创建</button>
+      </div>
     </section>
 
     <section v-if="phase === 'interrupted'" class="card alert">

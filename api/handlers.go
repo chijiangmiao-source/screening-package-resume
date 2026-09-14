@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,11 @@ import (
 )
 
 var sha256HexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// createTokenRE matches the client-generated idempotency key: 32 lowercase
+// hex characters (16 random bytes), generated for one "start upload" and
+// saved locally before the first request.
+var createTokenRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 type Server struct {
 	db      *sql.DB
@@ -164,6 +170,12 @@ type createSessionReq struct {
 	// chunk again. Optional: old clients omit it and always get a plain
 	// upload session.
 	ReuseArtifact bool `json:"reuse_artifact"`
+	// CreateToken is the client-generated idempotency key (32 lowercase hex).
+	// The page generates one for each "start upload", saves it locally, and
+	// re-sends the same token when the first create response was lost to a
+	// network failure/timeout. Optional: old clients omit it and always get a
+	// brand-new independent session.
+	CreateToken string `json:"create_token"`
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +196,40 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "filename must be 1..255 characters")
 		return
 	}
+	token := strings.TrimSpace(req.CreateToken)
+	if token != "" && !createTokenRE.MatchString(token) {
+		writeErr(w, http.StatusBadRequest, "create_token must be 32 lowercase hex characters when present")
+		return
+	}
+	if !sha256HexRE.MatchString(req.FileSHA256) {
+		writeErr(w, http.StatusBadRequest, "file_sha256 must be 64 lowercase hex characters")
+		return
+	}
+
+	// A request carrying a token that is ALREADY known replays (or conflicts
+	// against) the original create. Resolve it BEFORE validating that
+	// chunk_count matches total_bytes: the retry contract compares the five
+	// metadata fields verbatim, and a replayed chunk_count different from the
+	// original is a 409 token conflict (not a 400 count error), exactly like a
+	// different filename or digest. A brand-new token keeps every strict
+	// validation below.
+	if token != "" {
+		if existing, err := s.sessionByToken(token); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		} else if existing != nil {
+			s.resolveKnownToken(w, r, createIntent{
+				Filename:      req.Filename,
+				TotalBytes:    req.TotalBytes,
+				ChunkCount:    req.ChunkCount,
+				FileSHA256:    req.FileSHA256,
+				ReuseArtifact: req.ReuseArtifact,
+				Token:         token,
+			}, existing)
+			return
+		}
+	}
+
 	if req.TotalBytes < 1 {
 		writeErr(w, http.StatusBadRequest, "total_bytes must be >= 1")
 		return
@@ -209,8 +255,35 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("chunk_count %d does not match total_bytes (expect %d)", req.ChunkCount, wantChunks))
 		return
 	}
-	if !sha256HexRE.MatchString(req.FileSHA256) {
-		writeErr(w, http.StatusBadRequest, "file_sha256 must be 64 lowercase hex characters")
+
+	in := createIntent{
+		Filename:      req.Filename,
+		TotalBytes:    req.TotalBytes,
+		ChunkCount:    req.ChunkCount,
+		FileSHA256:    req.FileSHA256,
+		ReuseArtifact: req.ReuseArtifact,
+		Token:         token,
+	}
+
+	// Look up a reusable artifact before opening the idempotency transaction:
+	// the candidate check stats files on the volume and must not hold the
+	// SQLite write lock. The outcome is only persisted by the transaction,
+	// whose token check is what makes a lost-response retry repeat the very
+	// same result.
+	var owner *Session
+	if req.ReuseArtifact {
+		o, err := s.findReusableArtifact(req.FileSHA256, req.TotalBytes)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		owner = o
+	}
+
+	// Old clients (no create token): keep the historical behavior exactly —
+	// every request creates an independent session.
+	if token == "" {
+		s.createWithoutToken(w, in, owner)
 		return
 	}
 
@@ -219,41 +292,116 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "cannot allocate session id")
 		return
 	}
-	sess := &Session{
-		ID:         id,
-		Filename:   req.Filename,
-		TotalBytes: req.TotalBytes,
-		ChunkCount: req.ChunkCount,
-		FileSHA256: req.FileSHA256,
-		Status:     StatusUploading,
+	// The token was checked above and found unknown; createWithToken now
+	// serializes concurrent same-token inserts in ONE transaction (exactly
+	// one wins as 201, the rest replay as 200; a racer carrying the same
+	// token with other metadata still gets 409).
+	sess, replayed, err := s.createWithToken(r.Context(), in, owner, id)
+	if errors.Is(err, ErrCreateTokenConflict) {
+		writeErr(w, http.StatusConflict,
+			"create token was already used with different metadata; start a new delivery instead of retrying this one")
+		return
 	}
-	if req.ReuseArtifact {
-		owner, err := s.findReusableArtifact(req.FileSHA256, req.TotalBytes)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot persist session")
+		return
+	}
+	if replayed {
+		// Lost the race with a concurrent same-token request that committed
+		// first: answer with the winner's current snapshot as 200.
+		cur, err := s.getSession(sess.ID)
+		if err != nil || cur == nil {
+			writeErr(w, http.StatusInternalServerError, "cannot reload session")
+			return
+		}
+		resp, err := s.sessionResponse(cur)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if owner != nil {
-			// Reuse hit: the new session is completed at creation, points at
-			// the already published artifact, and needs zero chunk uploads.
-			sess.Status = StatusCompleted
-			sess.FinalSHA256 = sql.NullString{String: req.FileSHA256, Valid: true}
-			sess.ArtifactSource = sql.NullString{String: owner.ID, Valid: true}
-			if err := s.createReusedSession(sess, owner.ID); err != nil {
-				writeErr(w, http.StatusInternalServerError, "cannot persist session")
-				return
-			}
-			resp, err := s.sessionResponse(sess)
-			if err != nil {
-				writeErr(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			writeJSON(w, http.StatusCreated, resp)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	if sess.Status != StatusCompleted {
+		// Fresh plain upload session: create its chunk directory exactly once.
+		// Reuse-hit sessions own no chunks and need none.
+		if err := os.MkdirAll(s.chunkDir(sess.ID), 0o755); err != nil {
+			writeErr(w, http.StatusInternalServerError, "cannot create chunk directory")
 			return
 		}
-		// No usable candidate (none matched, or the artifact file is missing
-		// or length-abnormal): fall through to a normal upload session.
 	}
+	resp, err := s.sessionResponse(sess)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// resolveKnownToken answers a create request carrying a token that already
+// belongs to a session. Identical metadata replays that session's CURRENT
+// snapshot as 200 (no second row, no second chunk directory, reuse-hit
+// outcomes preserved); any differing field — filename, total bytes, chunk
+// count, digest, or reuse willingness — is a 409 conflict that leaves the
+// original session untouched.
+func (s *Server) resolveKnownToken(w http.ResponseWriter, r *http.Request, in createIntent, existing *Session) {
+	if !existing.matchesIntent(in) {
+		writeErr(w, http.StatusConflict,
+			"create token was already used with different metadata; start a new delivery instead of retrying this one")
+		return
+	}
+	// Answer with the current snapshot so progress (or a completion) reached
+	// while the first response was lost is visible immediately.
+	cur, err := s.getSession(existing.ID)
+	if err != nil || cur == nil {
+		writeErr(w, http.StatusInternalServerError, "cannot reload session")
+		return
+	}
+	resp, err := s.sessionResponse(cur)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// createWithoutToken keeps the historical create behavior for old clients:
+// every request inserts an independent upload session (or a completed
+// reuse-hit session) with no token.
+func (s *Server) createWithoutToken(w http.ResponseWriter, in createIntent, owner *Session) {
+	id, err := newSessionID()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot allocate session id")
+		return
+	}
+	sess := &Session{
+		ID:             id,
+		Filename:       in.Filename,
+		TotalBytes:     in.TotalBytes,
+		ChunkCount:     in.ChunkCount,
+		FileSHA256:     in.FileSHA256,
+		ReuseRequested: in.ReuseArtifact,
+	}
+	if owner != nil {
+		// Reuse hit: the new session is completed at creation, points at the
+		// already published artifact, and needs zero chunk uploads.
+		sess.Status = StatusCompleted
+		sess.FinalSHA256 = sql.NullString{String: in.FileSHA256, Valid: true}
+		sess.ArtifactSource = sql.NullString{String: owner.ID, Valid: true}
+		if err := s.createReusedSession(sess, owner.ID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "cannot persist session")
+			return
+		}
+		resp, err := s.sessionResponse(sess)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp)
+		return
+	}
+	sess.Status = StatusUploading
 	if err := s.createSession(sess); err != nil {
 		writeErr(w, http.StatusInternalServerError, "cannot persist session")
 		return

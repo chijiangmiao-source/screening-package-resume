@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,6 +44,18 @@ type Session struct {
 	// publish the assembly, so the event stream never misses or reorders an
 	// update and the sequence keeps growing across process restarts.
 	ProgressVersion int64
+	// CreateToken is the client-supplied idempotency key carried by a create
+	// request ("start upload" generated it before the first attempt and saved
+	// it locally). NULL for old clients. A retry after a lost create response
+	// presents the same token: the server answers again with the exact same
+	// session snapshot instead of inserting a second row.
+	CreateToken sql.NullString
+	// ReuseRequested records whether the create request declared the
+	// artifact-reuse willingness (reuse_artifact:true). It is persisted
+	// separately from the outcome: a retry carrying the same create token
+	// must match the willingness of the first attempt even when that attempt
+	// missed every reusable candidate and fell back to a plain upload.
+	ReuseRequested bool
 }
 
 // ChunkMeta is the confirmed-chunk metadata persisted in SQLite.
@@ -83,6 +97,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     error         TEXT,
     artifact_source TEXT,
     progress_version INTEGER NOT NULL DEFAULT 1,
+    create_token  TEXT,
+    reuse_requested INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -120,6 +136,36 @@ CREATE TABLE IF NOT EXISTS chunks (
 			return err
 		}
 	}
+	// Databases created before idempotent session creation existed lack the
+	// client create-token column. It is nullable (old sessions and old
+	// clients carry NULL) and UNIQUE: SQLite permits multiple NULLs, so the
+	// index can be built in place over existing rows. The index is what lets
+	// a retried "start upload" resolve the original session atomically even
+	// under concurrent requests carrying the same token.
+	has, err = hasColumn(db, "sessions", "create_token")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN create_token TEXT`); err != nil {
+			return err
+		}
+	}
+	// reuse_requested accompanies create_token: old rows default to 0 (old
+	// clients never declared reuse intent).
+	has, err = hasColumn(db, "sessions", "reuse_requested")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN reuse_requested INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_create_token ON sessions(create_token) WHERE create_token IS NOT NULL`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -154,20 +200,29 @@ func ExpectedChunkLen(totalBytes, chunkCount, idx int64) int64 {
 }
 
 func (s *Server) getSession(id string) (*Session, error) {
-	var sess Session
-	err := s.db.QueryRow(
-		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source, progress_version
-		 FROM sessions WHERE id = ?`, id).
-		Scan(&sess.ID, &sess.Filename, &sess.TotalBytes, &sess.ChunkCount,
-			&sess.FileSHA256, &sess.Status, &sess.FinalSHA256, &sess.Error,
-			&sess.ArtifactSource, &sess.ProgressVersion)
+	sess, err := scanSession(s.db.QueryRow(
+		`SELECT `+sessionColumns+` FROM sessions WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &sess, nil
+	return sess, nil
+}
+
+// sessionByToken looks up a session by its client-supplied create token.
+// Returns (nil, nil) when no session carries the token.
+func (s *Server) sessionByToken(token string) (*Session, error) {
+	sess, err := scanSession(s.db.QueryRow(
+		`SELECT `+sessionColumns+` FROM sessions WHERE create_token = ?`, token))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sess, nil
 }
 
 func (s *Server) listChunks(sessionID string) ([]ChunkMeta, error) {
@@ -210,25 +265,180 @@ func (s *Server) findChunk(sessionID string, index int64) (*ChunkMeta, error) {
 	return &c, nil
 }
 
-func (s *Server) createSession(sess *Session) error {
-	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status, progress_version)
-		 VALUES (?, ?, ?, ?, ?, ?, 1)`,
-		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256, StatusUploading)
+// dbtx is satisfied by *sql.DB, *sql.Tx and *sql.Conn, so the session INSERT
+// statements run either standalone (old clients, no create token) or inside
+// the idempotency transaction opened on a dedicated connection (clients
+// carrying a create token).
+type dbtx interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertSession(ctx context.Context, q dbtx, sess *Session, token sql.NullString, reuseRequested bool) error {
+	_, err := q.ExecContext(ctx,
+		`INSERT INTO sessions
+		    (id, filename, total_bytes, chunk_count, file_sha256, status, progress_version, create_token, reuse_requested)
+		 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256,
+		StatusUploading, token, reuseRequested)
 	return err
 }
 
-// createReusedSession persists a session that is completed at creation time:
+// insertReusedSession persists a session that is completed at creation time:
 // it owns no chunks and points at the artifact published by sourceID. Its
 // progress sequence also starts at 1: the snapshot delivered to a brand-new
 // subscription is the very first event, not an update.
-func (s *Server) createReusedSession(sess *Session, sourceID string) error {
-	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, artifact_source, progress_version)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+func insertReusedSession(ctx context.Context, q dbtx, sess *Session, sourceID string, token sql.NullString, reuseRequested bool) error {
+	_, err := q.ExecContext(ctx,
+		`INSERT INTO sessions
+		    (id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256,
+		     artifact_source, progress_version, create_token, reuse_requested)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256,
-		StatusCompleted, sess.FileSHA256, sourceID)
+		StatusCompleted, sess.FileSHA256, sourceID, token, reuseRequested)
 	return err
+}
+
+func (s *Server) createSession(sess *Session) error {
+	return insertSession(context.Background(), s.db, sess, sql.NullString{}, false)
+}
+
+func (s *Server) createReusedSession(sess *Session, sourceID string) error {
+	return insertReusedSession(context.Background(), s.db, sess, sourceID, sql.NullString{}, true)
+}
+
+// ErrCreateTokenConflict is returned by the idempotent create path when a
+// known create token is presented again alongside different session metadata
+// (filename, total bytes, chunk count, digest, or reuse willingness). The
+// existing session is left untouched and the caller must start over with a
+// fresh token.
+var ErrCreateTokenConflict = errors.New("create token was already used with different session metadata")
+
+// createIntent is the validated payload of a session-create request.
+type createIntent struct {
+	Filename      string
+	TotalBytes    int64
+	ChunkCount    int64
+	FileSHA256    string
+	ReuseArtifact bool
+	Token         string // empty for old clients that carry no create token
+}
+
+// sessionColumns lists every persisted session column in the SELECT order
+// used by scanSession.
+const sessionColumns = `id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source, progress_version, create_token, reuse_requested`
+
+// rowScanner is satisfied by *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSession(row rowScanner) (*Session, error) {
+	var sess Session
+	err := row.Scan(&sess.ID, &sess.Filename, &sess.TotalBytes, &sess.ChunkCount,
+		&sess.FileSHA256, &sess.Status, &sess.FinalSHA256, &sess.Error,
+		&sess.ArtifactSource, &sess.ProgressVersion, &sess.CreateToken, &sess.ReuseRequested)
+	if err != nil {
+		return nil, err
+	}
+	return &sess, nil
+}
+
+// matchesIntent reports whether a session previously created under the same
+// token describes exactly the delivery the retry asks for. The reuse
+// willingness is compared as persisted (not inferred from the outcome), so a
+// token cannot be replayed with a different reuse_artifact declaration.
+func (sess *Session) matchesIntent(in createIntent) bool {
+	return sess.Filename == in.Filename &&
+		sess.TotalBytes == in.TotalBytes &&
+		sess.ChunkCount == in.ChunkCount &&
+		sess.FileSHA256 == in.FileSHA256 &&
+		sess.ReuseRequested == in.ReuseArtifact
+}
+
+// createWithToken is the idempotent create path, executed as ONE
+// transaction:
+//
+//   - The token is looked up first. When a session already carries it and the
+//     metadata is byte-for-byte the same intent, that original session is
+//     returned (replayed=true): no second row and no second chunk directory
+//     are produced, and the answer is the session's CURRENT snapshot, so a
+//     retry after a lost response also observes chunks confirmed in between
+//     (or an artifact-reuse hit already completed at creation).
+//   - Same token, different metadata -> ErrCreateTokenConflict; the original
+//     session is not touched.
+//   - Unknown token -> the new session row is inserted in the same
+//     transaction (as a plain upload session, or completed pointing at
+//     reuseOwner when a reusable artifact was found before the transaction).
+//
+// The transaction opens BEGIN IMMEDIATE, taking SQLite's write lock up front:
+// two concurrent requests carrying the same brand-new token serialize there,
+// and the second one then resolves the row committed by the first instead of
+// colliding on the unique index.
+func (s *Server) createWithToken(ctx context.Context, in createIntent, reuseOwner *Session, newID string) (sess *Session, replayed bool, err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return nil, false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+
+	existing, qerr := scanSession(conn.QueryRowContext(ctx,
+		`SELECT `+sessionColumns+` FROM sessions WHERE create_token = ?`, in.Token))
+	if qerr != nil && qerr != sql.ErrNoRows {
+		return nil, false, qerr
+	}
+	if qerr == nil {
+		// The first create already committed (its response was lost): replay
+		// the original session when the intent matches, otherwise refuse.
+		if !existing.matchesIntent(in) {
+			return nil, false, ErrCreateTokenConflict
+		}
+		// Read-only resolution: release the write lock.
+		if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+			return nil, false, err
+		}
+		committed = true
+		return existing, true, nil
+	}
+
+	sess = &Session{
+		ID:             newID,
+		Filename:       in.Filename,
+		TotalBytes:     in.TotalBytes,
+		ChunkCount:     in.ChunkCount,
+		FileSHA256:     in.FileSHA256,
+		CreateToken:    sql.NullString{String: in.Token, Valid: true},
+		ReuseRequested: in.ReuseArtifact,
+	}
+	token := sql.NullString{String: in.Token, Valid: true}
+	if reuseOwner != nil {
+		// Reuse hit decided before the transaction: completed at creation,
+		// pointing at the already published artifact, zero chunk uploads.
+		sess.Status = StatusCompleted
+		sess.FinalSHA256 = sql.NullString{String: in.FileSHA256, Valid: true}
+		sess.ArtifactSource = sql.NullString{String: reuseOwner.ID, Valid: true}
+		if err := insertReusedSession(ctx, conn, sess, reuseOwner.ID, token, in.ReuseArtifact); err != nil {
+			return nil, false, err
+		}
+	} else {
+		sess.Status = StatusUploading
+		if err := insertSession(ctx, conn, sess, token, in.ReuseArtifact); err != nil {
+			return nil, false, err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return nil, false, err
+	}
+	committed = true
+	return sess, false, nil
 }
 
 // artifactOwner resolves the session whose own artifact file physically backs
@@ -263,7 +473,7 @@ func (s *Server) artifactOwner(sess *Session) (*Session, error) {
 // backing artifact file, or nil when no candidate is usable.
 func (s *Server) findReusableArtifact(fileSHA string, totalBytes int64) (*Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source, progress_version
+		`SELECT `+sessionColumns+`
 		 FROM sessions
 		 WHERE status = ? AND file_sha256 = ? AND total_bytes = ?
 		 ORDER BY created_at, id`,
@@ -276,14 +486,12 @@ func (s *Server) findReusableArtifact(fileSHA string, totalBytes int64) (*Sessio
 	// single connection, so checking while iterating would deadlock.
 	var cands []Session
 	for rows.Next() {
-		var cand Session
-		if err := rows.Scan(&cand.ID, &cand.Filename, &cand.TotalBytes, &cand.ChunkCount,
-			&cand.FileSHA256, &cand.Status, &cand.FinalSHA256, &cand.Error, &cand.ArtifactSource,
-			&cand.ProgressVersion); err != nil {
+		cand, err := scanSession(rows)
+		if err != nil {
 			rows.Close()
 			return nil, err
 		}
-		cands = append(cands, cand)
+		cands = append(cands, *cand)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()

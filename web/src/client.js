@@ -39,15 +39,32 @@ async function api(path, options = {}) {
 // reuseArtifact declares the willingness to reuse an already published
 // artifact of identical content (same whole-file digest and size); the
 // server may then complete the session immediately with zero chunk uploads.
-export function createSession({ filename, totalBytes, chunkCount, fileSha256, reuseArtifact = false }) {
+//
+// createToken (32 lowercase hex) is the idempotency key generated for one
+// "start upload" and saved locally before the request: if the create was
+// accepted but the response was lost to a timeout/network failure, the
+// "retry create" button re-sends the SAME token together with the already
+// computed metadata, and the server answers with the original session
+// instead of inserting a second one. Omit it for old-client behavior.
+export function createSession({ filename, totalBytes, chunkCount, fileSha256, reuseArtifact = false, createToken = '' }) {
   return api('/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       filename, total_bytes: totalBytes, chunk_count: chunkCount, file_sha256: fileSha256,
       reuse_artifact: reuseArtifact,
+      ...(createToken ? { create_token: createToken } : {}),
     }),
   })
+}
+
+// generateCreateToken mints the idempotency key for one delivery attempt:
+// 16 cryptographically random bytes rendered as 32 lowercase hex chars, the
+// same shape the server expects.
+export function generateCreateToken() {
+  const bytes = new Uint8Array(16)
+  globalThis.crypto.getRandomValues(bytes)
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 export function getSession(id) {

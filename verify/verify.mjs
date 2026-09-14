@@ -672,6 +672,254 @@ async function main() {
     console.log('  (API_PEER_URL unset; skipping cross-process sequence checks)')
   }
 
+  // ---------- scenario 10: idempotent create token ----------
+  console.log('[10] create token: lost-response replay, conflict, restart/peer resolution')
+  const newToken = () => crypto.randomBytes(16).toString('hex')
+  const createBody = (name, buf, fileSha, { reuse = false, token = '' } = {}) =>
+    JSON.stringify({
+      filename: name,
+      total_bytes: buf.length,
+      chunk_count: Math.ceil(buf.length / CHUNK),
+      file_sha256: fileSha,
+      reuse_artifact: reuse,
+      ...(token ? { create_token: token } : {}),
+    })
+
+  // postCreate posts one create request and returns {status, body}.
+  const postCreate = async (body) => {
+    const resp = await fetch(`${API}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    })
+    const text = await resp.text()
+    let b = null
+    try { b = JSON.parse(text) } catch { b = { error: text } }
+    return { status: resp.status, body: b }
+  }
+
+  // createAndLose fires the create, lets the server accept it, then ABORTS
+  // before reading the response — a real timeout-after-accept window.
+  const createAndLose = async (body) => {
+    const ctrl = new AbortController()
+    const p = fetch(`${API}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      signal: ctrl.signal,
+    }).catch(() => { /* lost response */ })
+    await sleep(300) // local container network: the row is committed by now
+    ctrl.abort()
+    await p
+  }
+
+  // --- 10a: plain upload, first create response lost -> replay the token ---
+  const file10 = crypto.randomBytes(2 * CHUNK + 333_333)
+  const file10Sha = sha(file10)
+  const token10 = newToken()
+  const meta10 = createBody('lost-create.mov', file10, file10Sha, { token: token10 })
+
+  // Deterministic first answer (its body is treated as never reaching the
+  // client, which only persisted the token).
+  let r10 = await postCreate(meta10)
+  check('10 first create returns 201', r10.status === 201, JSON.stringify(r10.body))
+  const id10 = r10.body.session_id
+  // Confirm chunk 0 AFTER the "lost" create: the replay must show current progress.
+  r = await putChunk(id10, 0, slice(file10, 0))
+  check('10 chunk 0 confirmed before replay', r.status === 201, JSON.stringify(r.body))
+
+  // Replay the same token with identical metadata: original session, 200.
+  r10 = await postCreate(meta10)
+  check('10 replayed create returns 200', r10.status === 200, `got ${r10.status}`)
+  check('10 replay returns the SAME session id', r10.body.session_id === id10,
+    `got ${r10.body.session_id}, want ${id10}`)
+  check('10 replay is the CURRENT snapshot (chunk 0 visible)',
+    r10.body.confirmed_bytes === CHUNK && r10.body.received_count === 1 &&
+    JSON.stringify(r10.body.missing_chunks) === '[1,2]',
+    JSON.stringify(r10.body))
+  // Exactly one chunk directory exists for this delivery: no duplicate dirs.
+  check('10 replay created no second chunk directory',
+    fs.existsSync(path.join(DATA_DIR, 'chunks', id10)) &&
+    fs.readdirSync(path.join(DATA_DIR, 'chunks')).filter((n) => n === id10).length === 1)
+
+  // A genuinely aborted (response-lost) create with a fresh token: its replay
+  // resolves the accepted session. If the abort landed before commit, the
+  // first replay is 201 and one more identical request must be 200.
+  const token10b = newToken()
+  const meta10b = createBody('aborted-create.mov', file10, file10Sha, { token: token10b })
+  await createAndLose(meta10b)
+  let rb = await postCreate(meta10b)
+  let id10b
+  if (rb.status === 201) {
+    id10b = rb.body.session_id
+    rb = await postCreate(meta10b)
+  } else {
+    id10b = rb.body.session_id
+  }
+  check('10 aborted-create replay resolves to one session (200 after acceptance)',
+    rb.status === 200 && typeof id10b === 'string',
+    `status=${rb.status} id=${id10b}`)
+  check('10 aborted replay keeps a single chunk directory',
+    fs.readdirSync(path.join(DATA_DIR, 'chunks')).filter((n) => n === id10b).length === 1)
+
+  // Finish the first delivery through the replayed session: resume semantics hold.
+  for (const idx of [1, 2]) {
+    r = await putChunk(id10, idx, slice(file10, idx))
+    check(`10 replayed session chunk ${idx} accepted`, r.status === 201, JSON.stringify(r.body))
+  }
+  r = await api(`/sessions/${id10}/assemble`, { method: 'POST' })
+  check('10 replayed session assembles and completes',
+    r.status === 200 && r.body.status === 'completed' && r.body.final_sha256 === file10Sha,
+    JSON.stringify(r.body))
+  check('10 replayed session artifact on volume', artifactFor(id10) !== null)
+
+  // --- 10b: reuse hit whose create response was lost -> same completed session ---
+  const token10r = newToken()
+  const meta10r = createBody('lost-reuse.mov', file, fileSha, { reuse: true, token: token10r })
+  r10 = await postCreate(meta10r)
+  check('10 reuse create returns 201 completed',
+    r10.status === 201 && r10.body.status === 'completed', `got ${r10.status}/${r10.body.status}`)
+  const id10r = r10.body.session_id
+  check('10 reuse create references scenario-1 source',
+    r10.body.artifact_source === sess.session_id, `got ${r10.body.artifact_source}`)
+  // Response lost -> replay: identical id, identical reuse outcome, zero chunks.
+  r10 = await postCreate(meta10r)
+  check('10 lost reuse replay is 200 same completed session',
+    r10.status === 200 && r10.body.session_id === id10r && r10.body.status === 'completed',
+    `got ${r10.status}/${r10.body.session_id}/${r10.body.status}`)
+  check('10 reuse replay keeps source and zero chunks',
+    r10.body.artifact_source === sess.session_id && r10.body.received_count === 0 &&
+    r10.body.confirmed_bytes === 0 && r10.body.missing_chunks.length === 0,
+    JSON.stringify(r10.body))
+  check('10 reuse replay created no chunk directory',
+    !fs.existsSync(path.join(DATA_DIR, 'chunks', id10r)))
+
+  // --- 10c: same token with different metadata -> 409, original untouched ---
+  const beforeConflict = await api(`/sessions/${id10}`)
+  const conflictCases = [
+    ['different filename', createBody('renamed-create.mov', file10, file10Sha, { token: token10 })],
+    ['different reuse willingness', createBody('lost-create.mov', file10, file10Sha, { reuse: true, token: token10 })],
+  ]
+  // Different bytes/chunk-count/digest needs its own valid metadata.
+  const other10 = crypto.randomBytes(CHUNK + 7)
+  conflictCases.push(['different bytes/digest',
+    createBody('lost-create.mov', other10, sha(other10), { token: token10 })])
+  // chunk_count only (same filename/bytes/digest): for a KNOWN token this is
+  // a token conflict, not the ordinary 400 count-consistency error.
+  conflictCases.push(['different chunk count',
+    JSON.stringify({
+      filename: 'lost-create.mov', total_bytes: file10.length, chunk_count: 99,
+      file_sha256: file10Sha, create_token: token10,
+    })])
+  for (const [name, body] of conflictCases) {
+    const cc = await postCreate(body)
+    check(`10 conflict (${name}) returns 409`, cc.status === 409, `got ${cc.status}`)
+  }
+  const afterConflict = await api(`/sessions/${id10}`)
+  check('10 original session unchanged after conflicts',
+    afterConflict.body.status === beforeConflict.body.status &&
+    afterConflict.body.filename === beforeConflict.body.filename &&
+    afterConflict.body.confirmed_bytes === beforeConflict.body.confirmed_bytes &&
+    afterConflict.body.final_sha256 === beforeConflict.body.final_sha256,
+    `before=${JSON.stringify(beforeConflict.body)} after=${JSON.stringify(afterConflict.body)}`)
+  check('10 original completed session still downloads after conflicts',
+    artifactFor(id10) !== null)
+
+  // --- 10d: token resolves through a SEPARATE process (peer = restart semantics) ---
+  if (API_PEER) {
+    // Publish an artifact through the primary process under a token first.
+    const file10p = crypto.randomBytes(CHUNK + 555)
+    const file10pSha = sha(file10p)
+    const token10p = newToken()
+    const meta10p = createBody('peer-token.mov', file10p, file10pSha, { token: token10p })
+    r10 = await postCreate(meta10p)
+    check('10 peer scenario primary create 201', r10.status === 201, JSON.stringify(r10.body))
+    const id10p = r10.body.session_id
+
+    // Publish this delivery fully so it can back a later reuse hit.
+    for (const idx of [0, 1]) {
+      const up = await putChunk(id10p, idx, slice(file10p, idx))
+      check(`10 peer-token source chunk ${idx} accepted`, up.status === 201, JSON.stringify(up.body))
+    }
+    r = await api(`/sessions/${id10p}/assemble`, { method: 'POST' })
+    check('10 peer-token source published',
+      r.status === 200 && r.body.status === 'completed', JSON.stringify(r.body))
+
+    // The peer process opened the same volume independently; the token must
+    // resolve to the same session there (restart-after-crash recovery).
+    const peerResp = await fetch(`${API_PEER}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: meta10p,
+    })
+    const peerBody = await peerResp.json()
+    check('10 token replay through separate peer process is 200 same session',
+      peerResp.status === 200 && peerBody.session_id === id10p,
+      `status=${peerResp.status} id=${peerBody.session_id}, want ${id10p}`)
+    // Reuse willingness is carried by the peer-resolved row too.
+    check('10 peer replay keeps identical metadata',
+      peerBody.filename === 'peer-token.mov' && peerBody.file_sha256 === file10pSha &&
+      peerBody.total_bytes === file10p.length)
+
+    // A token the peer has never seen in its own memory but that is in the
+    // shared DB is still replayable: create through primary, replay via peer
+    // WITH reuse declared against the just-published artifact.
+    const token10p2 = newToken()
+    const meta10p2 = createBody('peer-token-reuse.mov', file10p, file10pSha,
+      { reuse: true, token: token10p2 })
+    const first2 = await postCreate(meta10p2) // completed at creation via reuse
+    check('10 second peer-token primary create is reuse hit',
+      first2.status === 201 && first2.body.status === 'completed' &&
+      first2.body.artifact_source === id10p,
+      JSON.stringify(first2.body))
+    const peerResp2 = await fetch(`${API_PEER}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: meta10p2,
+    })
+    const peerBody2 = await peerResp2.json()
+    check('10 reuse token replay through peer is the same completed session',
+      peerResp2.status === 200 && peerBody2.session_id === first2.body.session_id &&
+      peerBody2.status === 'completed' && peerBody2.artifact_source === id10p,
+      `status=${peerResp2.status} body=${JSON.stringify(peerBody2)}`)
+  } else {
+    console.log('  (API_PEER_URL unset; skipping cross-process create-token checks)')
+  }
+
+  // --- 10e: old clients with no token still get independent sessions ---
+  const legacyBody = JSON.stringify({
+    filename: 'legacy-no-token.mov',
+    total_bytes: file10.length,
+    chunk_count: Math.ceil(file10.length / CHUNK),
+    file_sha256: file10Sha,
+  })
+  r10 = await postCreate(legacyBody)
+  check('10 tokenless create still returns 201 independent session',
+    r10.status === 201 && r10.body.status === 'uploading' && !r10.body.artifact_source &&
+    r10.body.session_id !== id10 && r10.body.session_id !== id10b,
+    JSON.stringify(r10.body))
+  check('10 tokenless create got its own chunk directory',
+    fs.existsSync(path.join(DATA_DIR, 'chunks', r10.body.session_id)))
+
+  // A brand-NEW token still obeys strict metadata validation: an
+  // inconsistent chunk_count is 400 (not turned into a token conflict).
+  const badCountBody = JSON.stringify({
+    filename: 'bad-count.mov', total_bytes: file10.length, chunk_count: 99,
+    file_sha256: file10Sha, create_token: newToken(),
+  })
+  r10 = await postCreate(badCountBody)
+  check('10 unknown token with inconsistent chunk_count is 400',
+    r10.status === 400, `got ${r10.status}`)
+  // A malformed token (not 32 lowercase hex) is also 400 and creates nothing.
+  const beforeMalformed = fs.readdirSync(path.join(DATA_DIR, 'chunks')).length
+  r10 = await postCreate(JSON.stringify({
+    filename: 'bad-token.mov', total_bytes: 10, chunk_count: 1,
+    file_sha256: file10Sha, create_token: 'NOT-HEX',
+  }))
+  check('10 malformed create_token rejected with 400', r10.status === 400, `got ${r10.status}`)
+  check('10 malformed token created no chunk directory',
+    fs.readdirSync(path.join(DATA_DIR, 'chunks')).length === beforeMalformed)
+
   console.log(`\nverify: ${passed} passed, ${failed} failed`)
   if (failed > 0) process.exit(1)
   console.log('verify: ACCEPTANCE OK')
