@@ -314,6 +314,110 @@ async function main() {
   })
   check('zero chunk_count rejected', r.status === 400, `got ${r.status}`)
 
+  // ---------- scenario 7: artifact reuse for repeat deliveries ----------
+  console.log('[7] artifact reuse: same content, new filename, zero chunks')
+  // Scenario 1 published `file`; a repeat delivery of the same content under
+  // a different filename and with reuse declared must complete at creation.
+  r = await api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: 'festival-screening-revival.mov',
+      total_bytes: file.length,
+      chunk_count: count,
+      file_sha256: fileSha,
+      reuse_artifact: true,
+    }),
+  })
+  check('reuse create returns 201', r.status === 201, JSON.stringify(r.body))
+  check('reuse hit completes immediately', r.body.status === 'completed', `got ${r.body.status}`)
+  check('reuse hit carries final digest', r.body.final_sha256 === fileSha,
+    `got ${r.body.final_sha256}`)
+  check('reuse hit uploads zero chunks', r.body.received_count === 0,
+    `received_count=${r.body.received_count}`)
+  check('reuse hit has no missing chunks',
+    Array.isArray(r.body.missing_chunks) && r.body.missing_chunks.length === 0,
+    `got ${r.body.missing_chunks}`)
+  check('reuse hit references the source session', r.body.artifact_source === sess.session_id,
+    `got ${r.body.artifact_source}`)
+  const reuseId = r.body.session_id
+  check('reuse creates a new session id', typeof reuseId === 'string' && reuseId !== sess.session_id)
+
+  // Query and download go through the NEW session id.
+  r = await api(`/sessions/${reuseId}`)
+  check('reused session queryable by new id', r.status === 200 && r.body.status === 'completed')
+  check('query keeps the reuse reference', r.body.artifact_source === sess.session_id)
+
+  resp = await fetch(`${API}/api/sessions/${reuseId}/download`)
+  const reusedBody = Buffer.from(await resp.arrayBuffer())
+  check('reused download returns 200', resp.status === 200, `got ${resp.status}`)
+  check('reused download bytes identical to source', reusedBody.equals(file),
+    `got ${reusedBody.length} bytes, want ${file.length}`)
+  check('reused download filename is the new submission',
+    (resp.headers.get('content-disposition') || '').includes('festival-screening-revival.mov'),
+    `got ${resp.headers.get('content-disposition')}`)
+  resp = await fetch(`${API}/api/sessions/${reuseId}/download`, { headers: { Range: `bytes=${CHUNK}-` } })
+  const reusedTail = Buffer.from(await resp.arrayBuffer())
+  check('reused download range resume returns 206', resp.status === 206, `got ${resp.status}`)
+  check('reused download range bytes match', reusedTail.equals(file.subarray(CHUNK)))
+
+  // Old clients that never declare reuse still get a plain upload session.
+  r = await createSession('legacy-client.mov', file, fileSha) // no reuse_artifact key
+  check('undeclared reuse returns 201', r.status === 201, `got ${r.status}`)
+  check('undeclared reuse stays a normal upload session',
+    r.body.status === 'uploading' && !r.body.artifact_source,
+    `status=${r.body.status} source=${r.body.artifact_source}`)
+  check('undeclared reuse lists every chunk missing',
+    JSON.stringify(r.body.missing_chunks) === JSON.stringify([...Array(count).keys()]),
+    `got ${r.body.missing_chunks}`)
+
+  // ---------- scenario 8: broken candidate falls back to normal upload ----------
+  console.log('[8] length-abnormal / missing candidate -> normal upload session')
+  const file8 = crypto.randomBytes(CHUNK + 42)
+  const file8Sha = sha(file8)
+  const count8 = Math.ceil(file8.length / CHUNK)
+  r = await createSession('brittle-source.mov', file8, file8Sha)
+  const s8 = r.body.session_id
+  for (const idx of [...Array(count8).keys()]) {
+    const up = await putChunk(s8, idx, slice(file8, idx))
+    check(`brittle source chunk ${idx} accepted`, up.status === 201, JSON.stringify(up.body))
+  }
+  r = await api(`/sessions/${s8}/assemble`, { method: 'POST' })
+  check('brittle source published', r.status === 200 && r.body.status === 'completed',
+    JSON.stringify(r.body))
+  const art8 = artifactFor(s8)
+  check('brittle artifact visible on volume', art8 !== null)
+
+  const reuseCreate8 = () => api('/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: 'brittle-redelivery.mov',
+      total_bytes: file8.length,
+      chunk_count: count8,
+      file_sha256: file8Sha,
+      reuse_artifact: true,
+    }),
+  })
+
+  // Length-abnormal candidate: truncated artifact must not be reused.
+  if (art8) fs.truncateSync(art8, Math.floor(file8.length / 2))
+  r = await reuseCreate8()
+  check('length-abnormal candidate returns 201', r.status === 201, `got ${r.status}`)
+  check('length-abnormal candidate falls back to upload session',
+    r.body.status === 'uploading' && !r.body.artifact_source && !r.body.final_sha256,
+    `status=${r.body.status} source=${r.body.artifact_source} final=${r.body.final_sha256}`)
+  check('fallback session lists every chunk missing',
+    JSON.stringify(r.body.missing_chunks) === JSON.stringify([...Array(count8).keys()]),
+    `got ${r.body.missing_chunks}`)
+
+  // Missing candidate: artifact deleted entirely.
+  if (art8) fs.unlinkSync(art8)
+  r = await reuseCreate8()
+  check('missing candidate falls back to upload session',
+    r.status === 201 && r.body.status === 'uploading' && !r.body.artifact_source,
+    `status=${r.status}/${r.body.status} source=${r.body.artifact_source}`)
+
   console.log(`\nverify: ${passed} passed, ${failed} failed`)
   if (failed > 0) process.exit(1)
   console.log('verify: ACCEPTANCE OK')

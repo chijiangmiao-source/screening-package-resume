@@ -36,12 +36,16 @@ async function api(path, options = {}) {
   }
 }
 
-export function createSession({ filename, totalBytes, chunkCount, fileSha256 }) {
+// reuseArtifact declares the willingness to reuse an already published
+// artifact of identical content (same whole-file digest and size); the
+// server may then complete the session immediately with zero chunk uploads.
+export function createSession({ filename, totalBytes, chunkCount, fileSha256, reuseArtifact = false }) {
   return api('/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       filename, total_bytes: totalBytes, chunk_count: chunkCount, file_sha256: fileSha256,
+      reuse_artifact: reuseArtifact,
     }),
   })
 }

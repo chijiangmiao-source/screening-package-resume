@@ -102,6 +102,7 @@ type sessionJSON struct {
 	MissingChunks  []int64 `json:"missing_chunks"`
 	FinalSHA256    *string `json:"final_sha256"`
 	Error          *string `json:"error"`
+	ArtifactSource *string `json:"artifact_source"`
 }
 
 func (s *Server) sessionResponse(sess *Session) (*sessionJSON, error) {
@@ -116,9 +117,13 @@ func (s *Server) sessionResponse(sess *Session) (*sessionJSON, error) {
 		confirmed += c.Size
 	}
 	missing := make([]int64, 0)
-	for i := int64(0); i < sess.ChunkCount; i++ {
-		if !present[i] {
-			missing = append(missing, i)
+	if sess.Status != StatusCompleted {
+		// A completed session (including an artifact-reuse hit, which owns
+		// no chunk rows) has nothing missing by definition.
+		for i := int64(0); i < sess.ChunkCount; i++ {
+			if !present[i] {
+				missing = append(missing, i)
+			}
 		}
 	}
 	resp := &sessionJSON{
@@ -139,6 +144,9 @@ func (s *Server) sessionResponse(sess *Session) (*sessionJSON, error) {
 	if sess.Error.Valid {
 		resp.Error = &sess.Error.String
 	}
+	if sess.ArtifactSource.Valid {
+		resp.ArtifactSource = &sess.ArtifactSource.String
+	}
 	return resp, nil
 }
 
@@ -149,6 +157,11 @@ type createSessionReq struct {
 	TotalBytes int64  `json:"total_bytes"`
 	ChunkCount int64  `json:"chunk_count"`
 	FileSHA256 string `json:"file_sha256"`
+	// ReuseArtifact declares the client's willingness to reuse an already
+	// published artifact of identical content instead of uploading every
+	// chunk again. Optional: old clients omit it and always get a plain
+	// upload session.
+	ReuseArtifact bool `json:"reuse_artifact"`
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +224,33 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		ChunkCount: req.ChunkCount,
 		FileSHA256: req.FileSHA256,
 		Status:     StatusUploading,
+	}
+	if req.ReuseArtifact {
+		owner, err := s.findReusableArtifact(req.FileSHA256, req.TotalBytes)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if owner != nil {
+			// Reuse hit: the new session is completed at creation, points at
+			// the already published artifact, and needs zero chunk uploads.
+			sess.Status = StatusCompleted
+			sess.FinalSHA256 = sql.NullString{String: req.FileSHA256, Valid: true}
+			sess.ArtifactSource = sql.NullString{String: owner.ID, Valid: true}
+			if err := s.createReusedSession(sess, owner.ID); err != nil {
+				writeErr(w, http.StatusInternalServerError, "cannot persist session")
+				return
+			}
+			resp, err := s.sessionResponse(sess)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, resp)
+			return
+		}
+		// No usable candidate (none matched, or the artifact file is missing
+		// or length-abnormal): fall through to a normal upload session.
 	}
 	if err := s.createSession(sess); err != nil {
 		writeErr(w, http.StatusInternalServerError, "cannot persist session")
@@ -521,7 +561,19 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := os.Open(s.artifactPath(sess))
+	// A reused session owns no artifact file itself: the body is read from
+	// the backing session's published artifact, while the response filename
+	// still comes from this session's own submission.
+	owner, err := s.artifactOwner(sess)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if owner == nil {
+		writeErr(w, http.StatusGone, "artifact missing on storage volume")
+		return
+	}
+	f, err := os.Open(s.artifactPath(owner))
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Database says completed but the artifact is gone from the volume.

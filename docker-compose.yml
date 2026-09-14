@@ -28,7 +28,9 @@ services:
       API_URL: http://api:8080
       DATA_DIR: /data
     volumes:
-      - delivery-data:/data:ro
+      # Read-write: the reuse-fallback scenario must corrupt/remove a
+      # candidate artifact on the volume to prove the server declines it.
+      - delivery-data:/data
     depends_on:
       api:
         condition: service_healthy

@@ -32,6 +32,10 @@ type Session struct {
 	Status      string
 	FinalSHA256 sql.NullString
 	Error       sql.NullString
+	// ArtifactSource, when set, is the id of the completed session whose
+	// published artifact physically backs this one (repeat delivery of the
+	// same content). NULL for sessions that uploaded their own chunks.
+	ArtifactSource sql.NullString
 }
 
 // ChunkMeta is the confirmed-chunk metadata persisted in SQLite.
@@ -61,7 +65,7 @@ func openDB(dataDir string) (*sql.DB, error) {
 }
 
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(`
+	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS sessions (
     id            TEXT PRIMARY KEY,
     filename      TEXT NOT NULL,
@@ -71,6 +75,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     status        TEXT NOT NULL DEFAULT 'uploading',
     final_sha256  TEXT,
     error         TEXT,
+    artifact_source TEXT,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -81,8 +86,41 @@ CREATE TABLE IF NOT EXISTS chunks (
     size         INTEGER NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (session_id, chunk_index)
-);`)
-	return err
+);`); err != nil {
+		return err
+	}
+	// Databases created before artifact reuse existed lack the column;
+	// add it nullable so existing session rows need no data migration.
+	has, err := hasColumn(db, "sessions", "artifact_source")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN artifact_source TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, rows.Err()
+		}
+	}
+	return false, rows.Err()
 }
 
 // ExpectedChunkLen returns the only valid length for chunk index idx.
@@ -98,10 +136,10 @@ func ExpectedChunkLen(totalBytes, chunkCount, idx int64) int64 {
 func (s *Server) getSession(id string) (*Session, error) {
 	var sess Session
 	err := s.db.QueryRow(
-		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error
+		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source
 		 FROM sessions WHERE id = ?`, id).
 		Scan(&sess.ID, &sess.Filename, &sess.TotalBytes, &sess.ChunkCount,
-			&sess.FileSHA256, &sess.Status, &sess.FinalSHA256, &sess.Error)
+			&sess.FileSHA256, &sess.Status, &sess.FinalSHA256, &sess.Error, &sess.ArtifactSource)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -164,6 +202,92 @@ func (s *Server) createSession(sess *Session) error {
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256, StatusUploading)
 	return err
+}
+
+// createReusedSession persists a session that is completed at creation time:
+// it owns no chunks and points at the artifact published by sourceID.
+func (s *Server) createReusedSession(sess *Session, sourceID string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, artifact_source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256,
+		StatusCompleted, sess.FileSHA256, sourceID)
+	return err
+}
+
+// artifactOwner resolves the session whose own artifact file physically backs
+// sess: reused sessions follow their artifact_source reference (created
+// pointing at the ultimate source, so normally a single hop), ordinary
+// sessions resolve to themselves. Returns (nil, nil) when the reference is
+// dangling, i.e. the backing session row no longer exists.
+func (s *Server) artifactOwner(sess *Session) (*Session, error) {
+	cur := sess
+	for depth := 0; cur.ArtifactSource.Valid; depth++ {
+		if depth >= 16 {
+			return nil, fmt.Errorf("artifact_source chain too deep at session %s", cur.ID)
+		}
+		next, err := s.getSession(cur.ArtifactSource.String)
+		if err != nil {
+			return nil, err
+		}
+		if next == nil {
+			return nil, nil
+		}
+		cur = next
+	}
+	return cur, nil
+}
+
+// findReusableArtifact looks for a completed session whose published artifact
+// can back a new delivery of identical content: the whole-file digest and the
+// total byte count must match, and the backing artifact file must still exist
+// on the volume with exactly the declared length. Candidates that fail the
+// on-disk check (missing or length-abnormal file) are skipped so the caller
+// falls back to a normal upload session. Returns the session that owns the
+// backing artifact file, or nil when no candidate is usable.
+func (s *Server) findReusableArtifact(fileSHA string, totalBytes int64) (*Session, error) {
+	rows, err := s.db.Query(
+		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source
+		 FROM sessions
+		 WHERE status = ? AND file_sha256 = ? AND total_bytes = ?
+		 ORDER BY created_at, id`,
+		StatusCompleted, fileSHA, totalBytes)
+	if err != nil {
+		return nil, err
+	}
+	// Materialize the candidates and close the cursor before the per-candidate
+	// checks: artifactOwner issues its own queries and the pool allows a
+	// single connection, so checking while iterating would deadlock.
+	var cands []Session
+	for rows.Next() {
+		var cand Session
+		if err := rows.Scan(&cand.ID, &cand.Filename, &cand.TotalBytes, &cand.ChunkCount,
+			&cand.FileSHA256, &cand.Status, &cand.FinalSHA256, &cand.Error, &cand.ArtifactSource); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		cands = append(cands, cand)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for i := range cands {
+		owner, err := s.artifactOwner(&cands[i])
+		if err != nil {
+			return nil, err
+		}
+		if owner == nil {
+			continue
+		}
+		st, err := os.Stat(s.artifactPath(owner))
+		if err != nil || st.Size() != totalBytes {
+			continue
+		}
+		return owner, nil
+	}
+	return nil, nil
 }
 
 func (s *Server) failSession(id, reason string) error {

@@ -23,8 +23,11 @@ let autoResumeTimer = null
 const confirmedBytes = computed(() => session.value?.confirmed_bytes ?? 0)
 const missingChunks = computed(() => session.value?.missing_chunks ?? [])
 const isCompleted = computed(() => session.value?.status === 'completed')
+const isReused = computed(() => !!session.value?.artifact_source)
 const progressPct = computed(() => {
   if (!session.value || !session.value.total_bytes) return 0
+  // A reuse hit completes with zero chunks of its own: show full progress.
+  if (isReused.value) return 100
   return Math.min(100, (confirmedBytes.value / session.value.total_bytes) * 100)
 })
 
@@ -93,7 +96,7 @@ async function start() {
 
   const chunkCount = chunkCountFor(f.size)
   const { status, body, network } = await createSession({
-    filename: f.name, totalBytes: f.size, chunkCount, fileSha256: digest,
+    filename: f.name, totalBytes: f.size, chunkCount, fileSha256: digest, reuseArtifact: true,
   })
   if (network) {
     phase.value = 'idle'
@@ -107,6 +110,14 @@ async function start() {
     return
   }
   session.value = body
+  if (body.status === 'completed') {
+    // 成品复用命中：服务端已有同内容成品，零分块完成，跳过上传与组装。
+    phase.value = 'done'
+    localStorage.removeItem(LS_KEY)
+    saved.value = null
+    note(`已复用成品（来源会话 ${body.artifact_source}），无需上传 ${chunkCount} 个分块`)
+    return
+  }
   localStorage.setItem(LS_KEY, JSON.stringify({
     sessionId: body.session_id, fileName: f.name, fileSize: f.size, fileSha256: digest,
   }))
@@ -326,15 +337,23 @@ function reset() {
       <table class="kv">
         <tr><td>会话 ID</td><td><code>{{ session.session_id }}</code></td></tr>
         <tr><td>状态</td><td><span :class="['badge', session.status]">{{ session.status }}</span></td></tr>
-        <tr><td>已确认字节</td><td>{{ confirmedBytes }} / {{ session.total_bytes }}（{{ fmtBytes(confirmedBytes) }}）</td></tr>
-        <tr><td>已确认分块</td><td>{{ session.received_count }} / {{ session.chunk_count }}</td></tr>
-        <tr>
-          <td>缺块列表</td>
-          <td>
-            <span v-if="missingChunks.length === 0">无</span>
-            <span v-else class="missing">{{ missingChunks.join(', ') }}</span>
-          </td>
-        </tr>
+        <template v-if="isReused">
+          <tr>
+            <td>成品来源</td>
+            <td><span class="reuse" data-test="reuse-badge">已复用成品</span>（来源会话 <code>{{ session.artifact_source }}</code>），本次零分块完成</td>
+          </tr>
+        </template>
+        <template v-else>
+          <tr><td>已确认字节</td><td>{{ confirmedBytes }} / {{ session.total_bytes }}（{{ fmtBytes(confirmedBytes) }}）</td></tr>
+          <tr><td>已确认分块</td><td>{{ session.received_count }} / {{ session.chunk_count }}</td></tr>
+          <tr>
+            <td>缺块列表</td>
+            <td>
+              <span v-if="missingChunks.length === 0">无</span>
+              <span v-else class="missing">{{ missingChunks.join(', ') }}</span>
+            </td>
+          </tr>
+        </template>
         <tr v-if="session.final_sha256"><td>完成摘要</td><td><code class="ok">{{ session.final_sha256 }}</code></td></tr>
         <tr v-if="session.error"><td>失败原因</td><td class="err">{{ session.error }}</td></tr>
       </table>
@@ -350,6 +369,7 @@ function reset() {
       <div class="row">
         <button data-test="download-btn" @click="downloadArtifact">下载成品</button>
       </div>
+      <p v-if="isReused" class="hint reuse" data-test="reuse-hint">已复用成品：同内容素材此前已交付，本次未重新上传分块。</p>
       <p class="hint">浏览器下载将沿用原始文件名；网络中断后可从已接收位置继续，无需重新传输整个文件。</p>
       <p v-if="downloadError" class="err" data-test="download-error">{{ downloadError }}</p>
     </section>
@@ -388,6 +408,7 @@ code.ok { color: #4ade80; }
 .badge.completed { background: #15803d; }
 .badge.failed { background: #b91c1c; }
 .missing { color: #fbbf24; font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
+.reuse { color: #4ade80; }
 .err { color: #f87171; }
 .banner { background: #2b1518; border: 1px solid #7f1d1d; padding: 10px 14px; border-radius: 8px; }
 .card.alert { border-color: #b45309; background: #241a10; }

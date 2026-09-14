@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type testEnv struct {
@@ -403,6 +405,351 @@ func TestDownloadUnknownSession(t *testing.T) {
 	code, _, _ := env.download("00000000000000000000000000000000", "")
 	if code != http.StatusNotFound {
 		t.Fatalf("unknown session download: got %d", code)
+	}
+}
+
+// createSessionRaw POSTs a create request, optionally declaring artifact
+// reuse, and returns the HTTP status plus the parsed session.
+func (e *testEnv) createSessionRaw(name string, total int64, fileSHA string, reuse bool) (int, sessionJSON) {
+	e.t.Helper()
+	count := (total + ChunkSize - 1) / ChunkSize
+	body, _ := json.Marshal(map[string]any{
+		"filename": name, "total_bytes": total, "chunk_count": count,
+		"file_sha256": fileSHA, "reuse_artifact": reuse,
+	})
+	resp, err := http.Post(e.srv.URL+"/api/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out sessionJSON
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+// 成品复用命中：同内容不同文件名的重复交付在创建时即完成，零分块上传，
+// 下载读取被复用的成品而响应文件名取自本次提交。
+func TestReuseArtifactHit(t *testing.T) {
+	env := newTestEnv(t)
+	total := 2*ChunkSize + 777
+	file, fileSHA := randomFile(t, total)
+	src := env.publish("原盘-正片.mov", file, fileSHA)
+
+	code, reuse := env.createSessionRaw("重映-正片.mov", total, fileSHA, true)
+	if code != http.StatusCreated {
+		t.Fatalf("reuse create: got %d", code)
+	}
+	if reuse.Status != StatusCompleted {
+		t.Fatalf("reuse status = %s, want completed", reuse.Status)
+	}
+	if reuse.SessionID == src.SessionID {
+		t.Fatal("reuse must create a new session id")
+	}
+	if reuse.FinalSHA256 == nil || *reuse.FinalSHA256 != fileSHA {
+		t.Fatalf("reuse final_sha256 = %v, want %s", reuse.FinalSHA256, fileSHA)
+	}
+	if reuse.ReceivedCount != 0 || reuse.ConfirmedBytes != 0 {
+		t.Fatalf("reuse must upload zero chunks: count=%d bytes=%d", reuse.ReceivedCount, reuse.ConfirmedBytes)
+	}
+	if len(reuse.MissingChunks) != 0 {
+		t.Fatalf("reuse missing = %v, want none", reuse.MissingChunks)
+	}
+	if reuse.ArtifactSource == nil || *reuse.ArtifactSource != src.SessionID {
+		t.Fatalf("artifact_source = %v, want %s", reuse.ArtifactSource, src.SessionID)
+	}
+	if reuse.Filename != "重映-正片.mov" {
+		t.Fatalf("filename = %q", reuse.Filename)
+	}
+
+	// Query and download use the NEW session id; the body is the reused
+	// artifact while Content-Disposition carries this submission's filename.
+	st := env.getSession(reuse.SessionID)
+	if st.Status != StatusCompleted || st.ArtifactSource == nil || *st.ArtifactSource != src.SessionID {
+		t.Fatalf("query by new id: %+v", st)
+	}
+	code, hdr, body := env.download(reuse.SessionID, "")
+	if code != http.StatusOK {
+		t.Fatalf("reuse download: got %d", code)
+	}
+	if !bytes.Equal(body, file) {
+		t.Fatal("reuse download body mismatch")
+	}
+	cd := hdr.Get("Content-Disposition")
+	if !strings.Contains(cd, "attachment") || !strings.Contains(cd, "%E9%87%8D%E6%98%A0") {
+		t.Fatalf("Content-Disposition must carry the new filename: %q", cd)
+	}
+	// Range resume works on the reused artifact too.
+	code, _, part := env.download(reuse.SessionID, fmt.Sprintf("bytes=%d-", ChunkSize))
+	if code != http.StatusPartialContent || !bytes.Equal(part, file[ChunkSize:]) {
+		t.Fatalf("reuse ranged download: code=%d bytes=%d", code, len(part))
+	}
+
+	// A third delivery reuses the reuse: the reference must point at the
+	// ultimate backing session, keeping the chain one hop deep.
+	code, third := env.createSessionRaw("三映-正片.mov", total, fileSHA, true)
+	if code != http.StatusCreated || third.Status != StatusCompleted {
+		t.Fatalf("third create: code=%d status=%s", code, third.Status)
+	}
+	if third.ArtifactSource == nil || *third.ArtifactSource != src.SessionID {
+		t.Fatalf("third artifact_source = %v, want ultimate source %s", third.ArtifactSource, src.SessionID)
+	}
+}
+
+// 候选损坏：成品文件长度异常或缺失时退回普通上传会话，不误报完成，
+// 退回后的会话可正常走分块上传与组装。
+func TestReuseFallbackWhenCandidateBroken(t *testing.T) {
+	env := newTestEnv(t)
+	total := ChunkSize + 42
+	file, fileSHA := randomFile(t, total)
+	src := env.publish("brittle-source.mov", file, fileSHA)
+	artPath := filepath.Join(env.dataDir, "artifacts",
+		src.SessionID+"-"+sanitizeFilename("brittle-source.mov"))
+
+	// Length-abnormal candidate: truncated artifact must not be reused.
+	if err := os.Truncate(artPath, total/2); err != nil {
+		t.Fatal(err)
+	}
+	code, st := env.createSessionRaw("retry-delivery.mov", total, fileSHA, true)
+	if code != http.StatusCreated {
+		t.Fatalf("fallback create: got %d", code)
+	}
+	if st.Status != StatusUploading || st.FinalSHA256 != nil || st.ArtifactSource != nil {
+		t.Fatalf("length-abnormal candidate must fall back to plain upload: %+v", st)
+	}
+	if !equalInts(st.MissingChunks, []int64{0, 1}) {
+		t.Fatalf("fallback missing = %v, want [0 1]", st.MissingChunks)
+	}
+
+	// Missing candidate: artifact deleted entirely.
+	if err := os.Remove(artPath); err != nil {
+		t.Fatal(err)
+	}
+	code, st2 := env.createSessionRaw("retry-delivery-2.mov", total, fileSHA, true)
+	if code != http.StatusCreated || st2.Status != StatusUploading || st2.ArtifactSource != nil {
+		t.Fatalf("missing candidate must fall back to plain upload: code=%d %+v", code, st2)
+	}
+
+	// The fallback session is a fully functional upload session: chunks and
+	// assembly behave exactly as before (断点续传不受影响).
+	if code, _, _ := env.uploadChunk(st.SessionID, 0, chunkOf(t, file, total, 0)); code != http.StatusCreated {
+		t.Fatalf("fallback chunk 0: got %d", code)
+	}
+	q := env.getSession(st.SessionID)
+	if !equalInts(q.MissingChunks, []int64{1}) {
+		t.Fatalf("fallback missing after chunk 0 = %v, want [1]", q.MissingChunks)
+	}
+	if code, _, _ := env.uploadChunk(st.SessionID, 1, chunkOf(t, file, total, 1)); code != http.StatusCreated {
+		t.Fatalf("fallback chunk 1: got %d", code)
+	}
+	code, done := env.assemble(st.SessionID)
+	if code != http.StatusOK || done.Status != StatusCompleted {
+		t.Fatalf("fallback assemble: code=%d status=%s", code, done.Status)
+	}
+}
+
+// 复用链候选损坏：来源成品被破坏后，经由复用会话组成的候选链也不得被选中，
+// 必须退回普通上传会话（且候选遍历不得在单连接池上死锁）。
+func TestReuseSkipsBrokenReuseChain(t *testing.T) {
+	env := newTestEnv(t)
+	total := ChunkSize + 42
+	file, fileSHA := randomFile(t, total)
+	src := env.publish("chain-master.mov", file, fileSHA)
+
+	// A reuse session now also matches digest+size, so the next lookup walks
+	// a candidate whose artifact_source must be resolved.
+	_, reuse := env.createSessionRaw("chain-copy.mov", total, fileSHA, true)
+	if reuse.Status != StatusCompleted {
+		t.Fatalf("reuse status = %s", reuse.Status)
+	}
+
+	// Break the ultimate backing artifact: every candidate (the source and
+	// the reuse pointing at it) is now unusable.
+	artPath := filepath.Join(env.dataDir, "artifacts",
+		src.SessionID+"-"+sanitizeFilename("chain-master.mov"))
+	if err := os.Truncate(artPath, 10); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var code int
+	var st sessionJSON
+	go func() {
+		defer close(done)
+		code, st = env.createSessionRaw("chain-retry.mov", total, fileSHA, true)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reuse lookup deadlocked on a broken reuse chain")
+	}
+	if code != http.StatusCreated || st.Status != StatusUploading || st.ArtifactSource != nil {
+		t.Fatalf("broken reuse chain must fall back to plain upload: code=%d %+v", code, st)
+	}
+}
+
+// 未声明复用：旧客户端不带 reuse_artifact 字段时，即使存在同内容成品，
+// 也仍然返回新建的普通上传会话。
+func TestReuseNotDeclaredWhenOmitted(t *testing.T) {
+	env := newTestEnv(t)
+	total := ChunkSize + 7
+	file, fileSHA := randomFile(t, total)
+	env.publish("already-there.mov", file, fileSHA)
+
+	// Old-style body: no reuse_artifact key at all.
+	count := (total + ChunkSize - 1) / ChunkSize
+	body, _ := json.Marshal(map[string]any{
+		"filename": "legacy-client.mov", "total_bytes": total,
+		"chunk_count": count, "file_sha256": fileSHA,
+	})
+	resp, err := http.Post(env.srv.URL+"/api/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st sessionJSON
+	_ = json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("legacy create: got %d", resp.StatusCode)
+	}
+	if st.Status != StatusUploading || st.ArtifactSource != nil {
+		t.Fatalf("undeclared reuse must create a plain upload session: %+v", st)
+	}
+	if !equalInts(st.MissingChunks, []int64{0, 1}) {
+		t.Fatalf("legacy missing = %v, want [0 1]", st.MissingChunks)
+	}
+
+	// Explicitly opting out behaves the same.
+	code, st2 := env.createSessionRaw("opted-out.mov", total, fileSHA, false)
+	if code != http.StatusCreated || st2.Status != StatusUploading || st2.ArtifactSource != nil {
+		t.Fatalf("opted-out create: code=%d %+v", code, st2)
+	}
+}
+
+// 重启后复用引用仍能解析：新进程复用同一数据卷，复用会话的查询与下载正常。
+func TestReuseSurvivesRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	total := 2*ChunkSize + 99
+	file, fileSHA := randomFile(t, total)
+
+	db1, err := openDB(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, _ := NewServer(db1, dataDir)
+	srv1 := httptest.NewServer(s1.Handler())
+	env1 := &testEnv{t: t, srv: srv1, server: s1, dataDir: dataDir}
+	src := env1.publish("母版.mov", file, fileSHA)
+	code, reuse := env1.createSessionRaw("巡展拷贝.mov", total, fileSHA, true)
+	if code != http.StatusCreated || reuse.Status != StatusCompleted {
+		t.Fatalf("reuse create: code=%d status=%s", code, reuse.Status)
+	}
+	srv1.Close()
+	db1.Close()
+
+	// "Restart": new server over the same data volume.
+	db2, err := openDB(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	s2, _ := NewServer(db2, dataDir)
+	srv2 := httptest.NewServer(s2.Handler())
+	defer srv2.Close()
+	env2 := &testEnv{t: t, srv: srv2, server: s2, dataDir: dataDir}
+
+	st := env2.getSession(reuse.SessionID)
+	if st.Status != StatusCompleted || st.ArtifactSource == nil || *st.ArtifactSource != src.SessionID {
+		t.Fatalf("reuse reference lost after restart: %+v", st)
+	}
+	code, hdr, body := env2.download(reuse.SessionID, "")
+	if code != http.StatusOK {
+		t.Fatalf("download after restart: got %d", code)
+	}
+	if !bytes.Equal(body, file) {
+		t.Fatal("download after restart: body mismatch")
+	}
+	if cd := hdr.Get("Content-Disposition"); !strings.Contains(cd, "%E5%B7%A1%E5%B1%95") {
+		t.Fatalf("Content-Disposition after restart must carry the reuse filename: %q", cd)
+	}
+}
+
+// 复用会话拒绝写入：已完成（复用）会话不接受分块上传与组装。
+func TestReusedSessionRejectsWrites(t *testing.T) {
+	env := newTestEnv(t)
+	total := ChunkSize + 7
+	file, fileSHA := randomFile(t, total)
+	env.publish("seed.mov", file, fileSHA)
+	_, reuse := env.createSessionRaw("again.mov", total, fileSHA, true)
+	if reuse.Status != StatusCompleted {
+		t.Fatalf("reuse status = %s", reuse.Status)
+	}
+	if code, _, _ := env.uploadChunk(reuse.SessionID, 0, chunkOf(t, file, total, 0)); code != http.StatusConflict {
+		t.Fatalf("chunk upload to reused session: got %d", code)
+	}
+	if code, _ := env.assemble(reuse.SessionID); code != http.StatusConflict {
+		t.Fatalf("assemble on reused session: got %d", code)
+	}
+}
+
+// 迁移：旧库（无 artifact_source 列）打开后自动补齐可空列，
+// 原有会话记录无需迁移数据，读取时成品来源为空。
+func TestMigrateAddsArtifactSourceColumn(t *testing.T) {
+	dataDir := t.TempDir()
+	// Build a database with the pre-reuse schema by hand.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", filepath.Join(dataDir, "app.db"))
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`
+CREATE TABLE sessions (
+    id            TEXT PRIMARY KEY,
+    filename      TEXT NOT NULL,
+    total_bytes   INTEGER NOT NULL,
+    chunk_count   INTEGER NOT NULL,
+    file_sha256   TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'uploading',
+    final_sha256  TEXT,
+    error         TEXT,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status)
+VALUES ('legacy1', 'old.mov', 10, 1, '` + sha256Hex([]byte("x")) + `', 'uploading');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	// Opening with the new binary migrates the schema in place.
+	db, err := openDB(dataDir)
+	if err != nil {
+		t.Fatalf("openDB over legacy schema: %v", err)
+	}
+	defer db.Close()
+	has, err := hasColumn(db, "sessions", "artifact_source")
+	if err != nil || !has {
+		t.Fatalf("artifact_source column missing after migration: has=%v err=%v", has, err)
+	}
+	s, err := NewServer(db, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := s.getSession("legacy1")
+	if err != nil || legacy == nil {
+		t.Fatalf("legacy session unreadable after migration: %v", err)
+	}
+	if legacy.ArtifactSource.Valid {
+		t.Fatal("legacy row must keep NULL artifact_source without data migration")
+	}
+	if legacy.Filename != "old.mov" || legacy.Status != StatusUploading {
+		t.Fatalf("legacy row altered by migration: %+v", legacy)
+	}
+	// The migrated schema accepts reuse sessions.
+	sha := sha256Hex([]byte("y"))
+	if err := s.createReusedSession(&Session{
+		ID: "reuse1", Filename: "new.mov", TotalBytes: 10, ChunkCount: 1, FileSHA256: sha,
+	}, "legacy1"); err != nil {
+		t.Fatalf("insert with artifact_source on migrated schema: %v", err)
 	}
 }
 
