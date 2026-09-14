@@ -730,6 +730,10 @@ VALUES ('legacy1', 'old.mov', 10, 1, '` + sha256Hex([]byte("x")) + `', 'uploadin
 	if err != nil || !has {
 		t.Fatalf("artifact_source column missing after migration: has=%v err=%v", has, err)
 	}
+	has, err = hasColumn(db, "sessions", "progress_version")
+	if err != nil || !has {
+		t.Fatalf("progress_version column missing after migration: has=%v err=%v", has, err)
+	}
 	s, err := NewServer(db, dataDir)
 	if err != nil {
 		t.Fatal(err)
@@ -740,6 +744,11 @@ VALUES ('legacy1', 'old.mov', 10, 1, '` + sha256Hex([]byte("x")) + `', 'uploadin
 	}
 	if legacy.ArtifactSource.Valid {
 		t.Fatal("legacy row must keep NULL artifact_source without data migration")
+	}
+	// Pre-stream rows start the progress sequence at 1: a fresh subscription
+	// receives their current snapshot as event #1.
+	if legacy.ProgressVersion != 1 {
+		t.Fatalf("legacy progress_version = %d, want 1", legacy.ProgressVersion)
 	}
 	if legacy.Filename != "old.mov" || legacy.Status != StatusUploading {
 		t.Fatalf("legacy row altered by migration: %+v", legacy)

@@ -131,17 +131,27 @@ async function startDelivery(wrapper, name, size = CHUNK + 123) {
 }
 
 describe('成品复用', () => {
+  const wrappers = []
+  const mountApp = () => {
+    const w = mount(App)
+    wrappers.push(w)
+    return w
+  }
+
   beforeEach(() => {
     localStorage.clear()
+    wrappers.length = 0
   })
 
   afterEach(() => {
+    // Close progress subscriptions / poll timers before fakes are restored.
+    wrappers.forEach((w) => w.unmount())
     vi.restoreAllMocks()
   })
 
   it('创建时声明复用意愿，命中后跳过分块上传与组装并展示已复用成品', async () => {
     const fake = installFakeApi({ reuseHit: true })
-    const wrapper = mount(App)
+    const wrapper = mountApp()
 
     await startDelivery(wrapper, '重映-正片.mov')
 
@@ -166,7 +176,7 @@ describe('成品复用', () => {
 
   it('复用未命中时退回普通分块上传流程，不展示已复用成品', async () => {
     const fake = installFakeApi({ reuseHit: false })
-    const wrapper = mount(App)
+    const wrapper = mountApp()
 
     await startDelivery(wrapper, '首映-正片.mov')
 

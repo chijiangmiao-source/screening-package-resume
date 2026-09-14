@@ -24,6 +24,7 @@ type Server struct {
 	db      *sql.DB
 	dataDir string
 	mu      sync.Mutex // serializes chunk ingestion and assembly per process
+	hub     *progressHub
 }
 
 func NewServer(db *sql.DB, dataDir string) (*Server, error) {
@@ -32,7 +33,7 @@ func NewServer(db *sql.DB, dataDir string) (*Server, error) {
 			return nil, err
 		}
 	}
-	return &Server{db: db, dataDir: dataDir}, nil
+	return &Server{db: db, dataDir: dataDir, hub: newProgressHub()}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -40,6 +41,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
+	mux.HandleFunc("GET /api/sessions/{id}/events", s.handleProgressEvents)
 	mux.HandleFunc("POST /api/sessions/{id}/chunks/{index}", s.handleUploadChunk)
 	mux.HandleFunc("POST /api/sessions/{id}/assemble", s.handleAssemble)
 	mux.HandleFunc("GET /api/sessions/{id}/download", s.handleDownload)
@@ -50,7 +52,7 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256, Range")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256, Range, Last-Event-ID")
 		w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Disposition")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -344,16 +346,18 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	if existing != nil {
 		if existing.SHA256 == actualSHA {
 			// Idempotent retry: same index, same digest -> success, not counted twice.
+			// No state changes, so the progress sequence does not advance.
 			s.respondChunk(w, http.StatusOK, sess, index, actualSHA, wantLen, true)
 			return
 		}
 		// Same index, different content: freeze the session as failed.
 		reason := fmt.Sprintf("chunk %d conflict: stored sha256 %s, received %s",
 			index, existing.SHA256, actualSHA)
-		if err := s.failSession(sess.ID, reason); err != nil {
+		if _, err := s.failSessionTx(sess.ID, reason); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		s.emitProgress(sess.ID)
 		writeErr(w, http.StatusConflict, reason)
 		return
 	}
@@ -362,10 +366,13 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "cannot persist chunk: "+err.Error())
 		return
 	}
-	if err := s.insertChunk(sess.ID, index, actualSHA, wantLen); err != nil {
+	// The chunk row and the bumped progress sequence commit together:
+	// subscribers can never observe a new sequence without the new chunk.
+	if _, err := s.confirmChunkTx(sess.ID, index, actualSHA, wantLen); err != nil {
 		writeErr(w, http.StatusInternalServerError, "cannot record chunk: "+err.Error())
 		return
 	}
+	s.emitProgress(sess.ID)
 	s.respondChunk(w, http.StatusCreated, sess, index, actualSHA, wantLen, false)
 }
 
@@ -476,7 +483,6 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 		s.failWithSession(w, sess, reason)
 		return
 	}
-
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
@@ -495,12 +501,14 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "publish failed: "+err.Error())
 		return
 	}
-	if err := s.completeSession(sess.ID, finalSHA); err != nil {
+	if _, err := s.completeSessionTx(sess.ID, finalSHA); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	sess.Status = StatusCompleted
 	sess.FinalSHA256 = sql.NullString{String: finalSHA, Valid: true}
+	sess.ProgressVersion++
+	s.emitProgress(sess.ID)
 	resp, err := s.sessionResponse(sess)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -512,9 +520,15 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 // failWithSession freezes the session and answers with the full session state
 // so clients can directly observe the failure.
 func (s *Server) failWithSession(w http.ResponseWriter, sess *Session, reason string) {
-	_ = s.failSession(sess.ID, reason)
+	newSeq, err := s.failSessionTx(sess.ID, reason)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	sess.Status = StatusFailed
 	sess.Error = sql.NullString{String: reason, Valid: true}
+	sess.ProgressVersion = newSeq
+	s.emitProgress(sess.ID)
 	resp, err := s.sessionResponse(sess)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

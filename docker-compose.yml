@@ -22,10 +22,29 @@ services:
     depends_on:
       - api
 
+  # Second API process over the SAME data volume, started only for the
+  # acceptance run (verify profile). It stands in for a restarted api:
+  # verify writes through `api`, then opens SSE / uploads through this peer
+  # to prove the persisted progress sequence survives across processes and
+  # keeps increasing. Auto-activates when `verify` starts; plain
+  # `docker compose up` never starts it.
+  api-peer:
+    build: ./api
+    profiles: ["verify"]
+    environment:
+      DATA_DIR: /data
+      ADDR: :8080
+    volumes:
+      - delivery-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+
   verify:
     build: ./verify
     environment:
       API_URL: http://api:8080
+      API_PEER_URL: http://api-peer:8080
       DATA_DIR: /data
     volumes:
       # Read-write: the reuse-fallback scenario must corrupt/remove a
@@ -34,6 +53,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      api-peer:
+        condition: service_started
 
 volumes:
   delivery-data:

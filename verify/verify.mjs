@@ -6,11 +6,97 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 const API = process.env.API_URL || 'http://api:8080'
+const API_PEER = process.env.API_PEER_URL || '' // second process over the same volume
 const DATA_DIR = process.env.DATA_DIR || '/data'
 const CHUNK = 1048576
 
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// ---- Server-Sent Events client (raw streaming fetch, no EventSource in node) ----
+
+function parseSSEBlock(block) {
+  let id = null, event = null, data = ''
+  for (const line of block.split('\n')) {
+    const ln = line.replace(/\r$/, '')
+    if (ln.startsWith(':')) return null // heartbeat / comment
+    if (ln.startsWith('id:')) id = ln.slice(3).trim()
+    else if (ln.startsWith('event:')) event = ln.slice(6).trim()
+    else if (ln.startsWith('data:')) data += ln.slice(5).trim()
+  }
+  if (!data) return null
+  let payload
+  try { payload = JSON.parse(data) } catch { return null }
+  return { id: id === null ? null : Number(id), event, payload }
+}
+
+// Open an SSE subscription. nextEvent() waits for the next non-heartbeat
+// event; quiet() asserts nothing arrives; close() aborts the connection.
+function openEvents(sessionId, { after = 0, base = API } = {}) {
+  const controller = new AbortController()
+  const url = `${base}/api/sessions/${sessionId}/events` + (after ? `?after=${after}` : '')
+  const queue = []
+  const waiters = []
+  let failed = null
+  const fail = (err) => {
+    failed = err
+    let w
+    while ((w = waiters.shift())) w.reject(err || new Error('stream closed'))
+  }
+  // ready resolves once the response headers are validated as an SSE
+  // response; the body keeps pumping in the background afterwards.
+  const ready = (async () => {
+    const resp = await fetch(url, { signal: controller.signal })
+    if (!resp.ok || !(resp.headers.get('content-type') || '').startsWith('text/event-stream')) {
+      throw new Error(`events open failed: HTTP ${resp.status}`)
+    }
+    // Pump independently of readiness so events queue while the caller is
+    // still between `await ready` and the first nextEvent().
+    ;(async () => {
+      const reader = resp.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          let cut
+          while ((cut = buf.indexOf('\n\n')) >= 0) {
+            const ev = parseSSEBlock(buf.slice(0, cut))
+            buf = buf.slice(cut + 2)
+            if (ev) {
+              // Hand the event to a waiting nextEvent, or buffer it — never
+              // both, or one event would be observed twice.
+              const waiter = waiters.shift()
+              if (waiter) waiter.resolve(ev)
+              else queue.push(ev)
+            }
+          }
+        }
+      } catch (err) {
+        if (err.name !== 'AbortError') fail(err)
+      }
+      if (!failed) fail(null)
+    })()
+  })()
+  return {
+    ready,
+    async nextEvent(ms = 5000) {
+      if (queue.length) return queue.shift()
+      if (failed) throw failed
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('timed out waiting for SSE event')), ms)
+        waiters.push({ resolve: (ev) => { clearTimeout(t); resolve(ev) }, reject: (e) => { clearTimeout(t); reject(e) } })
+      })
+    },
+    async quiet(ms = 400) {
+      await sleep(ms)
+      return queue.length === 0 && !failed
+    },
+    close() { controller.abort() },
+  }
+}
 
 let passed = 0
 let failed = 0
@@ -417,6 +503,174 @@ async function main() {
   check('missing candidate falls back to upload session',
     r.status === 201 && r.body.status === 'uploading' && !r.body.artifact_source,
     `status=${r.status}/${r.body.status} source=${r.body.artifact_source}`)
+
+  // ---------- scenario 9: SSE progress event stream ----------
+  console.log('[9] progress event stream: snapshot, per-change updates, reconnect')
+  const file9 = crypto.randomBytes(2 * CHUNK + 333) // 3 chunks
+  const file9Sha = sha(file9)
+  const count9 = Math.ceil(file9.length / CHUNK)
+  r = await createSession('live-progress.mov', file9, file9Sha)
+  check('events scenario session created', r.status === 201, JSON.stringify(r.body))
+  const s9 = r.body.session_id
+
+  // Unknown session: the stream endpoint answers 404 JSON like GET does.
+  const ghost = await fetch(`${API}/api/sessions/${'0'.repeat(32)}/events`)
+  check('events for unknown session return 404', ghost.status === 404, `got ${ghost.status}`)
+  check('events 404 is JSON, not a stream',
+    (ghost.headers.get('content-type') || '').startsWith('application/json'))
+  await ghost.body.cancel()
+
+  // Subscription first receives the complete snapshot at sequence 1.
+  const stream = openEvents(s9)
+  await stream.ready
+  let ev = await stream.nextEvent()
+  check('subscription opens with a snapshot', ev.event === 'snapshot', `got ${ev.event}`)
+  check('snapshot sequence starts at 1', ev.id === 1, `got id=${ev.id}`)
+  check('snapshot payload is the full uploading session',
+    ev.payload.session && ev.payload.session.status === 'uploading' &&
+    ev.payload.session.confirmed_bytes === 0 &&
+    JSON.stringify(ev.payload.session.missing_chunks) === JSON.stringify([0, 1, 2]),
+    JSON.stringify(ev.payload.session))
+  check('snapshot matches GET session response',
+    (await api(`/sessions/${s9}`)).body.session_id === ev.payload.session.session_id)
+
+  // Chunk 0 confirmed -> exactly one numbered update.
+  await putChunk(s9, 0, slice(file9, 0))
+  ev = await stream.nextEvent()
+  check('chunk confirmation pushes one update', ev.event === 'update' && ev.id === 2,
+    `got ${ev.event}/${ev.id}`)
+  check('update carries confirmed bytes and missing list',
+    ev.payload.session.confirmed_bytes === CHUNK &&
+    JSON.stringify(ev.payload.session.missing_chunks) === '[1,2]',
+    JSON.stringify({ b: ev.payload.session.confirmed_bytes, m: ev.payload.session.missing_chunks }))
+
+  // Idempotent duplicate changes nothing -> no update event.
+  await putChunk(s9, 0, slice(file9, 0))
+  check('idempotent duplicate emits no update', await stream.quiet(500))
+
+  // Remaining chunks each produce one incrementing update.
+  await putChunk(s9, 1, slice(file9, 1))
+  ev = await stream.nextEvent()
+  check('second chunk update is seq 3', ev.id === 3 && ev.payload.session.confirmed_bytes === 2 * CHUNK,
+    `got id=${ev.id}`)
+  await putChunk(s9, 2, slice(file9, 2))
+  ev = await stream.nextEvent()
+  check('third chunk update is seq 4 with everything confirmed',
+    ev.id === 4 && ev.payload.session.confirmed_bytes === file9.length &&
+    ev.payload.session.missing_chunks.length === 0,
+    `got id=${ev.id}`)
+
+  // Assembly completion arrives as the final, ordered update.
+  r = await api(`/sessions/${s9}/assemble`, { method: 'POST' })
+  check('streamed session assembles', r.status === 200 && r.body.status === 'completed',
+    JSON.stringify(r.body))
+  ev = await stream.nextEvent()
+  check('completion is delivered in order as seq 5',
+    ev.event === 'update' && ev.id === 5 && ev.payload.session.status === 'completed' &&
+    ev.payload.session.final_sha256 === file9Sha,
+    `got ${ev.event}/${ev.id}`)
+  check('completed session emits no further updates', await stream.quiet(500))
+  stream.close()
+
+  // Reconnect carrying the last sequence with no increments in between:
+  // the server still answers with the current snapshot at that sequence.
+  const replay = openEvents(s9, { after: 5 })
+  await replay.ready
+  ev = await replay.nextEvent()
+  check('up-to-date reconnect gets the current snapshot',
+    ev.event === 'snapshot' && ev.id === 5 && ev.payload.session.status === 'completed' &&
+    ev.payload.session.final_sha256 === file9Sha,
+    `got ${ev.event}/${ev.id}`)
+  replay.close()
+
+  // Stale reconnect (simulating a longer disconnect) also gets the newest
+  // snapshot rather than a replayed delta.
+  const stale = openEvents(s9, { after: 2 })
+  await stale.ready
+  ev = await stale.nextEvent()
+  check('stale reconnect gets the newest snapshot directly',
+    ev.event === 'snapshot' && ev.id === 5 && ev.payload.session.status === 'completed',
+    `got ${ev.event}/${ev.id}`)
+  stale.close()
+
+  // ----- cross-process persistence: a second server over the SAME volume -----
+  if (API_PEER) {
+    console.log('[9b] sequence persists across processes and keeps increasing')
+    // The peer container is only "started" (not health-checked) by compose;
+    // wait for it here so a slow boot cannot fail the subscription.
+    for (let i = 0; i < 60; i++) {
+      try {
+        if ((await fetch(`${API_PEER}/api/health`)).ok) break
+      } catch { /* peer still booting */ }
+      await sleep(1000)
+    }
+
+    const fileP = crypto.randomBytes(CHUNK + 333) // 2 chunks
+    const filePSha = sha(fileP)
+    r = await createSession('cross-process.mov', fileP, filePSha)
+    check('peer scenario session created', r.status === 201, JSON.stringify(r.body))
+    const sp = r.body.session_id
+
+    // Write chunk 0 through the primary process; the sequence is now 2.
+    await putChunk(sp, 0, slice(fileP, 0))
+
+    // The second process reads the persisted sequence and snapshots it.
+    const peerStream = openEvents(sp, { base: API_PEER })
+    await peerStream.ready
+    ev = await peerStream.nextEvent()
+    check('peer process snapshot shows persisted seq 2',
+      ev.event === 'snapshot' && ev.id === 2 && ev.payload.session.confirmed_bytes === CHUNK &&
+      JSON.stringify(ev.payload.session.missing_chunks) === '[1]',
+      `got ${ev.event}/${ev.id}`)
+
+    // Chunk committed by the peer process increments to 3 and its own live
+    // subscriber receives the update.
+    const peerPut = await fetch(`${API_PEER}/api/sessions/${sp}/chunks/1`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-SHA256': sha(slice(fileP, 1)) },
+      body: slice(fileP, 1),
+    })
+    check('peer process accepts chunk', peerPut.status === 201, `got ${peerPut.status}`)
+    ev = await peerStream.nextEvent()
+    check('sequence keeps increasing across processes to seq 3',
+      ev.id === 3 && ev.payload.session.confirmed_bytes === fileP.length &&
+      ev.payload.session.missing_chunks.length === 0,
+      `got id=${ev.id}`)
+
+    // Assembly by the peer publishes (seq 4) and notifies its subscriber.
+    const peerAssemble = await fetch(`${API_PEER}/api/sessions/${sp}/assemble`, { method: 'POST' })
+    check('peer process assembles session', peerAssemble.status === 200,
+      `got ${peerAssemble.status}`)
+    ev = await peerStream.nextEvent()
+    check('completion observed on the peer at seq 4',
+      ev.id === 4 && ev.payload.session.status === 'completed' &&
+      ev.payload.session.final_sha256 === filePSha,
+      `got id=${ev.id}`)
+    peerStream.close()
+
+    // The primary process never handled these writes: a fresh subscription
+    // through it must still return the newest completed snapshot from the
+    // shared database, proving the sequence survives across processes.
+    const primaryReplay = openEvents(sp, { after: 4 })
+    await primaryReplay.ready
+    ev = await primaryReplay.nextEvent()
+    check('primary reconnect reads peer-persisted newest snapshot',
+      ev.event === 'snapshot' && ev.id === 4 && ev.payload.session.status === 'completed' &&
+      ev.payload.session.final_sha256 === filePSha,
+      `got ${ev.event}/${ev.id}`)
+    primaryReplay.close()
+
+    // And a new chunk stream created without a position on the peer likewise
+    // starts from the persisted sequence (no restart resets it to 1).
+    const peerFresh = openEvents(sp, { base: API_PEER })
+    await peerFresh.ready
+    ev = await peerFresh.nextEvent()
+    check('fresh peer subscription does not restart the sequence at 1',
+      ev.id === 4 && ev.payload.session.status === 'completed', `got id=${ev.id}`)
+    peerFresh.close()
+  } else {
+    console.log('  (API_PEER_URL unset; skipping cross-process sequence checks)')
+  }
 
   console.log(`\nverify: ${passed} passed, ${failed} failed`)
   if (failed > 0) process.exit(1)

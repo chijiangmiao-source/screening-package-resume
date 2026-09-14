@@ -36,6 +36,12 @@ type Session struct {
 	// published artifact physically backs this one (repeat delivery of the
 	// same content). NULL for sessions that uploaded their own chunks.
 	ArtifactSource sql.NullString
+	// ProgressVersion is the persisted SSE progress sequence. It starts at 1
+	// when the session row is created and is incremented inside the very same
+	// transactions that confirm a chunk, freeze the session on a conflict, or
+	// publish the assembly, so the event stream never misses or reorders an
+	// update and the sequence keeps growing across process restarts.
+	ProgressVersion int64
 }
 
 // ChunkMeta is the confirmed-chunk metadata persisted in SQLite.
@@ -76,6 +82,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     final_sha256  TEXT,
     error         TEXT,
     artifact_source TEXT,
+    progress_version INTEGER NOT NULL DEFAULT 1,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -97,6 +104,19 @@ CREATE TABLE IF NOT EXISTS chunks (
 	}
 	if !has {
 		if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN artifact_source TEXT`); err != nil {
+			return err
+		}
+	}
+	// Databases created before the SSE progress stream existed lack the
+	// sequence column. Existing rows start at 1: a fresh SSE subscription on
+	// an old session first receives its current snapshot and only subsequent
+	// (new-binary) state changes produce numbered updates.
+	has, err = hasColumn(db, "sessions", "progress_version")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN progress_version INTEGER NOT NULL DEFAULT 1`); err != nil {
 			return err
 		}
 	}
@@ -136,10 +156,11 @@ func ExpectedChunkLen(totalBytes, chunkCount, idx int64) int64 {
 func (s *Server) getSession(id string) (*Session, error) {
 	var sess Session
 	err := s.db.QueryRow(
-		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source
+		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source, progress_version
 		 FROM sessions WHERE id = ?`, id).
 		Scan(&sess.ID, &sess.Filename, &sess.TotalBytes, &sess.ChunkCount,
-			&sess.FileSHA256, &sess.Status, &sess.FinalSHA256, &sess.Error, &sess.ArtifactSource)
+			&sess.FileSHA256, &sess.Status, &sess.FinalSHA256, &sess.Error,
+			&sess.ArtifactSource, &sess.ProgressVersion)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -189,27 +210,22 @@ func (s *Server) findChunk(sessionID string, index int64) (*ChunkMeta, error) {
 	return &c, nil
 }
 
-func (s *Server) insertChunk(sessionID string, index int64, sha256 string, size int64) error {
-	_, err := s.db.Exec(
-		`INSERT INTO chunks (session_id, chunk_index, sha256, size) VALUES (?, ?, ?, ?)`,
-		sessionID, index, sha256, size)
-	return err
-}
-
 func (s *Server) createSession(sess *Session) error {
 	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status, progress_version)
+		 VALUES (?, ?, ?, ?, ?, ?, 1)`,
 		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256, StatusUploading)
 	return err
 }
 
 // createReusedSession persists a session that is completed at creation time:
-// it owns no chunks and points at the artifact published by sourceID.
+// it owns no chunks and points at the artifact published by sourceID. Its
+// progress sequence also starts at 1: the snapshot delivered to a brand-new
+// subscription is the very first event, not an update.
 func (s *Server) createReusedSession(sess *Session, sourceID string) error {
 	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, artifact_source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions (id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, artifact_source, progress_version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
 		sess.ID, sess.Filename, sess.TotalBytes, sess.ChunkCount, sess.FileSHA256,
 		StatusCompleted, sess.FileSHA256, sourceID)
 	return err
@@ -247,7 +263,7 @@ func (s *Server) artifactOwner(sess *Session) (*Session, error) {
 // backing artifact file, or nil when no candidate is usable.
 func (s *Server) findReusableArtifact(fileSHA string, totalBytes int64) (*Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source
+		`SELECT id, filename, total_bytes, chunk_count, file_sha256, status, final_sha256, error, artifact_source, progress_version
 		 FROM sessions
 		 WHERE status = ? AND file_sha256 = ? AND total_bytes = ?
 		 ORDER BY created_at, id`,
@@ -262,7 +278,8 @@ func (s *Server) findReusableArtifact(fileSHA string, totalBytes int64) (*Sessio
 	for rows.Next() {
 		var cand Session
 		if err := rows.Scan(&cand.ID, &cand.Filename, &cand.TotalBytes, &cand.ChunkCount,
-			&cand.FileSHA256, &cand.Status, &cand.FinalSHA256, &cand.Error, &cand.ArtifactSource); err != nil {
+			&cand.FileSHA256, &cand.Status, &cand.FinalSHA256, &cand.Error, &cand.ArtifactSource,
+			&cand.ProgressVersion); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -290,20 +307,89 @@ func (s *Server) findReusableArtifact(fileSHA string, totalBytes int64) (*Sessio
 	return nil, nil
 }
 
-func (s *Server) failSession(id, reason string) error {
-	_, err := s.db.Exec(
-		`UPDATE sessions SET status = ?, error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ? AND status = ?`,
-		StatusFailed, reason, id, StatusUploading)
-	return err
+// progressVersion reads the current SSE progress sequence of a session.
+func (s *Server) progressVersion(id string) (int64, error) {
+	var v int64
+	err := s.db.QueryRow(`SELECT progress_version FROM sessions WHERE id = ?`, id).Scan(&v)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
-func (s *Server) completeSession(id, finalSHA string) error {
-	_, err := s.db.Exec(
-		`UPDATE sessions SET status = ?, final_sha256 = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ? AND status = ?`,
-		StatusCompleted, finalSHA, id, StatusUploading)
-	return err
+// confirmChunkTx records a freshly confirmed chunk and bumps the SSE progress
+// sequence in one transaction, so subscribers either observe both the new
+// chunk row and the new sequence number or neither. It returns the new
+// sequence.
+func (s *Server) confirmChunkTx(sessionID string, index int64, sha256Hex string, size int64) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`INSERT INTO chunks (session_id, chunk_index, sha256, size) VALUES (?, ?, ?, ?)`,
+		sessionID, index, sha256Hex, size); err != nil {
+		return 0, err
+	}
+	var version int64
+	if err := tx.QueryRow(
+		`UPDATE sessions
+		 SET progress_version = progress_version + 1,
+		     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id = ?
+		 RETURNING progress_version`, sessionID).Scan(&version); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// failSessionTx freezes the session as failed with the given reason and bumps
+// the SSE progress sequence in the same transaction (conflict freeze and
+// assembly failure). Returns the new sequence.
+func (s *Server) failSessionTx(id, reason string) (int64, error) {
+	var version int64
+	err := s.db.QueryRow(
+		`UPDATE sessions
+		 SET status = ?, error = ?,
+		     progress_version = progress_version + 1,
+		     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id = ? AND status = ?
+		 RETURNING progress_version`,
+		StatusFailed, reason, id, StatusUploading).Scan(&version)
+	if err == sql.ErrNoRows {
+		// Already terminal: its state and sequence are unchanged.
+		if existing, gerr := s.getSession(id); gerr == nil && existing != nil {
+			return existing.ProgressVersion, nil
+		}
+		return 0, err
+	}
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// completeSessionTx publishes the assembly outcome: it marks the session
+// completed with its final digest and bumps the SSE progress sequence in the
+// same transaction. Returns the new sequence.
+func (s *Server) completeSessionTx(id, finalSHA string) (int64, error) {
+	var version int64
+	err := s.db.QueryRow(
+		`UPDATE sessions
+		 SET status = ?, final_sha256 = ?,
+		     progress_version = progress_version + 1,
+		     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id = ? AND status = ?
+		 RETURNING progress_version`,
+		StatusCompleted, finalSHA, id, StatusUploading).Scan(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 // ---- filesystem layout on the data volume ----

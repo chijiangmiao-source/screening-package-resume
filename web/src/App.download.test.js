@@ -121,21 +121,30 @@ async function completeDelivery(wrapper, name = 'festival-reel.mov', size = CHUN
 describe('成品下载入口', () => {
   let fake
   let clickSpy
+  const wrappers = []
+  const mountApp = () => {
+    const w = mount(App)
+    wrappers.push(w)
+    return w
+  }
 
   beforeEach(() => {
     localStorage.clear()
+    wrappers.length = 0
     fake = installFakeApi()
     // Keep jsdom from attempting real navigation on the download anchor.
     clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
   })
 
   afterEach(() => {
+    // Close any progress subscriptions / poll timers before fakes are restored.
+    wrappers.forEach((w) => w.unmount())
     clickSpy.mockRestore()
     vi.restoreAllMocks()
   })
 
   it('completed 后显示文件名、总字节数与下载按钮，点击后交给浏览器下载', async () => {
-    const wrapper = mount(App)
+    const wrapper = mountApp()
     expect(wrapper.find('[data-test="download-area"]').exists()).toBe(false)
 
     await completeDelivery(wrapper)
@@ -160,7 +169,7 @@ describe('成品下载入口', () => {
   })
 
   it('上传中会话请求下载返回 409，原因显示在下载区域', async () => {
-    const wrapper = mount(App)
+    const wrapper = mountApp()
     await completeDelivery(wrapper)
     const id = [...fake.sessions.keys()][0]
 
@@ -178,7 +187,7 @@ describe('成品下载入口', () => {
   })
 
   it('成品缺失返回 410，原因显示在下载区域', async () => {
-    const wrapper = mount(App)
+    const wrapper = mountApp()
     await completeDelivery(wrapper)
     const id = [...fake.sessions.keys()][0]
 
@@ -208,7 +217,7 @@ describe('成品下载入口', () => {
       error: null,
     })
 
-    const wrapper = mount(App)
+    const wrapper = mountApp()
     await wrapper.find('input.sid').setValue('old-session-1')
     const loadBtn = wrapper.findAll('button').find((b) => b.text() === '载入会话')
     await loadBtn.trigger('click')
@@ -221,7 +230,7 @@ describe('成品下载入口', () => {
   })
 
   it('上传中的会话不显示下载入口，上传/补传流程不受影响', async () => {
-    const wrapper = mount(App)
+    const wrapper = mountApp()
     await pickFile(wrapper, 'partial.mov', CHUNK + 10)
 
     // Fake a network drop on the second chunk to leave the session uploading.

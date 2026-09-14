@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   CHUNK_SIZE, chunkCountFor, hashFile,
   createSession, getSession, uploadChunks, assemble,
   downloadUrl, checkDownload,
 } from './client.js'
+import { subscribeProgress, eventsSupported } from './events.js'
 
 const LS_KEY = 'delivery.session'
 
@@ -18,7 +19,11 @@ const manualId = ref('')
 const saved = ref(null)        // pending session restored from localStorage
 const retrying = ref(false)    // a chunk is being retried after a network drop
 const downloadError = ref('')  // 409/410 reason shown inside the download area
+// Live-progress link state. The stream only refreshes the progress area;
+// it never drives upload controls ('interrupted' here is just the notice).
+const streamState = ref('')    // '' | connecting | live | interrupted
 let autoResumeTimer = null
+let progressSub = null
 
 const confirmedBytes = computed(() => session.value?.confirmed_bytes ?? 0)
 const missingChunks = computed(() => session.value?.missing_chunks ?? [])
@@ -62,7 +67,7 @@ function onPick(e) {
 async function refreshSession(id) {
   const { status, body } = await getSession(id)
   if (status === 200) {
-    session.value = body
+    bindSession(body)
     downloadError.value = ''
     if (body.status === 'failed') { phase.value = 'failed'; error.value = body.error || '会话已冻结为 failed' }
     if (body.status === 'completed') phase.value = 'done'
@@ -70,6 +75,52 @@ async function refreshSession(id) {
   }
   error.value = body?.error || `查询会话失败（HTTP ${status}）`
   return false
+}
+
+// ---- live progress event stream ----
+// The stream only refreshes the progress area. A transient drop shows a
+// notice and reconnects by itself; it must never flip phase or disable the
+// upload controls (those are driven solely by the upload flow below).
+let progressSubId = null
+
+function stopProgressStream() {
+  if (progressSub) {
+    progressSub.close()
+    progressSub = null
+  }
+  progressSubId = null
+  streamState.value = ''
+}
+
+function startProgressStream(id) {
+  if (!id || progressSubId === id) return
+  stopProgressStream()
+  progressSubId = id
+  streamState.value = 'connecting'
+  progressSub = subscribeProgress(id, {
+    onStatus: (s) => { streamState.value = s },
+    onSnapshot: (s) => {
+      // Full server state: replace the progress area wholesale.
+      session.value = s
+      downloadError.value = ''
+      if (s.status === 'failed') {
+        phase.value = 'failed'
+        error.value = s.error || '会话已冻结为 failed'
+      } else if (s.status === 'completed') {
+        // Another workstation may have finished the delivery; the projection
+        // team can take over as soon as this is visible.
+        phase.value = 'done'
+        localStorage.removeItem(LS_KEY)
+        saved.value = null
+      }
+    },
+  })
+}
+
+// bindSession records the session and opens (or reuses) its live stream.
+function bindSession(s) {
+  session.value = s
+  startProgressStream(s.session_id)
 }
 
 async function start() {
@@ -109,7 +160,7 @@ async function start() {
     error.value = body?.error || `创建会话失败（HTTP ${status}）`
     return
   }
-  session.value = body
+  bindSession(body)
   if (body.status === 'completed') {
     // 成品复用命中：服务端已有同内容成品，零分块完成，跳过上传与组装。
     phase.value = 'done'
@@ -203,7 +254,7 @@ async function resumeNow(id = session.value?.session_id) {
     clearInterval(autoResumeTimer)
     autoResumeTimer = null
   }
-  session.value = r.body
+  bindSession(r.body)
   note('连接已恢复，已重新查询缺块列表')
   if (r.body.status === 'completed') {
     phase.value = 'done'
@@ -232,13 +283,13 @@ async function doAssemble() {
     return
   }
   if (status === 200) {
-    session.value = body
+    bindSession(body)
     phase.value = 'done'
     localStorage.removeItem(LS_KEY)
     saved.value = null
     note(`发布完成，最终摘要 ${body.final_sha256}`)
   } else {
-    if (body && body.session_id) session.value = body
+    if (body && body.session_id) bindSession(body)
     phase.value = 'failed'
     error.value = body?.error || `组装失败（HTTP ${status}）`
     note(`组装失败：${error.value}`)
@@ -277,6 +328,7 @@ function reset() {
     clearInterval(autoResumeTimer)
     autoResumeTimer = null
   }
+  stopProgressStream()
   localStorage.removeItem(LS_KEY)
   saved.value = null
   session.value = null
@@ -287,6 +339,11 @@ function reset() {
   retrying.value = false
   log.value = []
 }
+
+onBeforeUnmount(() => {
+  stopProgressStream()
+  if (autoResumeTimer) clearInterval(autoResumeTimer)
+})
 </script>
 
 <template>
@@ -333,7 +390,17 @@ function reset() {
     </section>
 
     <section v-if="session" class="card">
-      <h2>会话状态</h2>
+      <h2>
+        会话状态
+        <span v-if="eventsSupported() && streamState === 'live'" class="stream live" data-test="stream-live">实时</span>
+        <span v-else-if="eventsSupported() && streamState === 'connecting'" class="stream connecting" data-test="stream-connecting">连接中…</span>
+      </h2>
+      <p v-if="streamState === 'interrupted'" class="stream-warn" data-test="stream-interrupted">
+        实时更新已中断，正在自动重连…（上传控制不受影响，可继续续传）
+      </p>
+      <p v-else-if="!eventsSupported() && streamState" class="hint" data-test="stream-poll">
+        当前浏览器不支持事件流，正在每 3 秒轮询刷新进度。
+      </p>
       <table class="kv">
         <tr><td>会话 ID</td><td><code>{{ session.session_id }}</code></td></tr>
         <tr><td>状态</td><td><span :class="['badge', session.status]">{{ session.status }}</span></td></tr>
@@ -416,6 +483,10 @@ code.ok { color: #4ade80; }
 .card.download { border-color: #15803d; }
 .card.download h2 { color: #4ade80; }
 .warn { color: #fbbf24; }
+.stream { font-size: 11.5px; font-weight: normal; margin-left: 8px; padding: 1px 9px; border-radius: 999px; vertical-align: middle; }
+.stream.live { background: #14532d; color: #86efac; }
+.stream.connecting { background: #2a3142; color: #aab3c5; }
+.stream-warn { margin: 0 0 8px; padding: 7px 12px; border-radius: 8px; background: #2b2110; border: 1px solid #b45309; color: #fbbf24; font-size: 13px; }
 .bar { height: 8px; background: #10131a; border-radius: 999px; margin-top: 12px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: #3b82f6; transition: width 0.2s; }
 .bar i.completed { background: #22c55e; }
