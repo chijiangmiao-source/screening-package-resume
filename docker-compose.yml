@@ -42,6 +42,13 @@ services:
 
   verify:
     build: ./verify
+    # One-shot acceptance container. Without this profile it would be part of
+    # the default `docker compose up` target set, but it depends on api-peer
+    # (which itself only exists under this profile) — Compose would then abort
+    # with a missing-dependency error. Keeping both on the same profile means
+    # a plain `up` starts only web + api, while `--profile verify up` starts
+    # api, api-peer and this one-shot verifier together.
+    profiles: ["verify"]
     environment:
       API_URL: http://api:8080
       API_PEER_URL: http://api-peer:8080
